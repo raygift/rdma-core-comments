@@ -551,7 +551,7 @@ static void rs_configure(void)
 	if (init)
 		goto out;
 
-	if (ucma_init())
+	if (ucma_init()) // 确保存在rdma 设备
 		goto out;
 	ucma_ib_init();
 
@@ -611,7 +611,7 @@ out:
 static int rs_insert(struct rsocket *rs, int index)
 {
 	pthread_mutex_lock(&mut);
-	rs->index = idm_set(&idm, index, rs);
+	rs->index = idm_set(&idm, index, rs);// 将rs 存入index_map 中，原样返回index
 	pthread_mutex_unlock(&mut);
 	return rs->index;
 }
@@ -1182,18 +1182,18 @@ int rsocket(int domain, int type, int protocol)
 	    (type == SOCK_DGRAM && protocol && protocol != IPPROTO_UDP))
 		return ERR(ENOTSUP);
 
-	rs_configure();
-	rs = rs_alloc(NULL, type);
+	rs_configure();// TODO
+	rs = rs_alloc(NULL, type); // 从正在监听的socket 继承一系列属性
 	if (!rs)
 		return ERR(ENOMEM);
 
-	if (type == SOCK_STREAM) {
-		ret = rdma_create_id(NULL, &rs->cm_id, rs, RDMA_PS_TCP);
+	if (type == SOCK_STREAM) {// tcp 类型
+		ret = rdma_create_id(NULL, &rs->cm_id, rs, RDMA_PS_TCP);// 创建cm_id，赋值给 rs->cm_id，并将rs 设为cm_id 的context
 		if (ret)
 			goto err;
 
 		rs->cm_id->route.addr.src_addr.sa_family = domain;
-		index = rs->cm_id->channel->fd;
+		index = rs->cm_id->channel->fd; // 将cm_id -> event channel ->fd 赋值给 index
 	} else {
 		ret = ds_init(rs, domain);
 		if (ret)
@@ -1202,11 +1202,11 @@ int rsocket(int domain, int type, int protocol)
 		index = rs->udp_sock;
 	}
 
-	ret = rs_insert(rs, index);
+	ret = rs_insert(rs, index);// 将 rs->cm_id->channel->fd 在全局idm 中的索引值 赋值给 rs->index，将rs 存入index_map 中
 	if (ret < 0)
 		goto err;
 
-	return rs->index;
+	return rs->index;// rs->index 即为上述index，也即 cm_id->channel->fd
 
 err:
 	rs_free(rs);
@@ -1218,11 +1218,11 @@ int rbind(int socket, const struct sockaddr *addr, socklen_t addrlen)
 	struct rsocket *rs;
 	int ret;
 
-	rs = idm_lookup(&idm, socket);
+	rs = idm_lookup(&idm, socket);// 根据fd 找到对应rsocket 实例
 	if (!rs)
 		return ERR(EBADF);
-	if (rs->type == SOCK_STREAM) {
-		ret = rdma_bind_addr(rs->cm_id, (struct sockaddr *) addr);
+	if (rs->type == SOCK_STREAM) {// tcp bind
+		ret = rdma_bind_addr(rs->cm_id, (struct sockaddr *) addr);// 完成cm_id 与 ip 地址的绑定
 		if (!ret)
 			rs->state = rs_bound;
 	} else {
@@ -1362,9 +1362,9 @@ static int rs_do_connect(struct rsocket *rs)
 resolve_addr:
 		to = 1000 << rs->retries++;
 		ret = rdma_resolve_addr(rs->cm_id, NULL,
-					&rs->cm_id->route.addr.dst_addr, to);
+					&rs->cm_id->route.addr.dst_addr, to);// 执行完rdma_resolve_addr 后，cm_id 根据路由表查到可到达目标地址的本地rdma 设备确定完成绑定
 		if (!ret)
-			goto resolve_route;
+			goto resolve_route;// 执行完rdma_resolve_addr 后，转向resolve route
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			rs->state = rs_resolving_addr;
 		break;
@@ -1390,9 +1390,9 @@ resolve_route:
 				goto resolving_route;
 			}
 		} else {
-			ret = rdma_resolve_route(rs->cm_id, to);
+			ret = rdma_resolve_route(rs->cm_id, to);// 获取到目标addr 的路径， the call obtains a path record 供新建的connection 使用
 			if (!ret)
-				goto do_connect;
+				goto do_connect;// 完成resolv route，转向 do_connect
 		}
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			rs->state = rs_resolving_route;
@@ -1406,7 +1406,7 @@ resolving_route:
 			break;
 		}
 do_connect:
-		ret = rs_create_ep(rs);
+		ret = rs_create_ep(rs);// 创建endpoint，包括创建cq ，post_recv
 		if (ret)
 			break;
 
@@ -1687,7 +1687,9 @@ out:
 	fastlock_release(&rs->map_lock);
 	return ret;
 }
-
+/*
+将 addr 赋值给 cm_id->route.addr.dst_addr ，并执行connect
+*/
 int rconnect(int socket, const struct sockaddr *addr, socklen_t addrlen)
 {
 	struct rsocket *rs;

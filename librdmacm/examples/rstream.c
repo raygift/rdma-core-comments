@@ -408,14 +408,14 @@ static int client_connect(void)
 	socklen_t len;
 
 	ret = use_rgai ? rdma_getaddrinfo(dst_addr, port, &rai_hints, &rai) :
-			 getaddrinfo(dst_addr, port, &ai_hints, &ai);
+			 getaddrinfo(dst_addr, port, &ai_hints, &ai);// 未使用-f 指定协议族时，默认使用getaddrinfo，获取到的信息存入ai
 
 	if (ret) {
 		printf("getaddrinfo: %s\n", gai_strerror(ret));
 		return ret;
 	}
 
-	if (src_addr) {
+	if (src_addr) { // 若使用-b 指定绑定ip，则server 只能使用src_addr 提供服务
 		if (use_rgai) {
 			rai_hints.ai_flags |= RAI_PASSIVE;
 			ret = rdma_getaddrinfo(src_addr, port, &rai_hints, &rai_src);
@@ -430,7 +430,7 @@ static int client_connect(void)
 	}
 
 	rs = rai ? rs_socket(rai->ai_family, SOCK_STREAM, 0) :
-		   rs_socket(ai->ai_family, SOCK_STREAM, 0);
+		   rs_socket(ai->ai_family, SOCK_STREAM, 0);//  创建fd，详见rsocket.c/rsocket(), indexer.c/idm_set(); rs 对应fd，也对应rsocket 实例->index
 	if (rs < 0) {
 		ret = rs;
 		goto free;
@@ -440,7 +440,7 @@ static int client_connect(void)
 
 	if (src_addr) {
 		ret = rai ? rs_bind(rs, rai_src->ai_src_addr, rai_src->ai_src_len) :
-			    rs_bind(rs, ai_src->ai_addr, ai_src->ai_addrlen);
+			    rs_bind(rs, ai_src->ai_addr, ai_src->ai_addrlen);// 完成cm_id 与ip地址的绑定
 		if (ret) {
 			perror("rbind");
 			goto close;
@@ -457,7 +457,7 @@ static int client_connect(void)
 	}
 
 	ret = rai ? rs_connect(rs, rai->ai_dst_addr, rai->ai_dst_len) :
-		    rs_connect(rs, ai->ai_addr, ai->ai_addrlen);
+		    rs_connect(rs, ai->ai_addr, ai->ai_addrlen);// 
 	if (ret && (errno != EINPROGRESS)) {
 		perror("rconnect");
 		goto close;
@@ -516,9 +516,9 @@ static int run(void)
 
 	printf("%-10s%-8s%-8s%-8s%-8s%8s %10s%13s\n",
 	       "name", "bytes", "xfers", "iters", "total", "time", "Gb/sec", "usec/xfer");
-	if (!custom) {
+	if (!custom) { // 没有用户自定义的运行参数
 		optimization = opt_latency;
-		ret = dst_addr ? client_connect() : server_connect();
+		ret = dst_addr ? client_connect() : server_connect(); // 根据dst_addr，分别处理client 和server connect
 		if (ret)
 			goto free;
 

@@ -53,7 +53,7 @@ static inline int rs_socket(int f, int t, int p)
 	if (!use_rs)
 		return socket(f, t, p);
 
-	fd = rsocket(f, t, p);
+	fd = rsocket(f, t, p);// fd 为rdma_create_fd 得到的fd，加入到全局idm 中的索引号
 	if (fd < 0) {
 		if (t == SOCK_STREAM && errno == ENODEV)
 			fprintf(stderr, "No RDMA devices were detected\n");

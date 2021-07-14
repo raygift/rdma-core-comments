@@ -137,19 +137,19 @@ int idm_set(struct index_map *idm, int index, void *item)
 {
 	void **entry;
 
-	if (index > IDX_MAX_INDEX) {
+	if (index > IDX_MAX_INDEX) {//IDX_MAX_INDEX 由1向左移位16位再减1，得到二进制 2的16次方-1=65535；index 需要小于65535
 		errno = ENOMEM;
 		return -1;
 	}
 
-	if (!idm->array[idx_array_index(index)]) {
-		if (idm_grow(idm, index) < 0)
+	if (!idm->array[idx_array_index(index)]) {// idx_array_index(index) 为index 右移10位；若对应idm->array 中序号 idx_array_index(index) 的元素不存在，
+		if (idm_grow(idm, index) < 0)// 分配1024 bytes 内存，其字节全部初始为0，并将新分配内存的指针赋值给array 此序号元素
 			return -1;
 	}
 
-	entry = idm->array[idx_array_index(index)];
-	entry[idx_entry_index(index)] = item;
-	return index;
+	entry = idm->array[idx_array_index(index)]; // 将上述内存指针赋值给 entry
+	entry[idx_entry_index(index)] = item; // 将rsocket 生成的fd 存入上述内存
+	return index;// 原样返回index
 }
 
 void *idm_clear(struct index_map *idm, int index)
