@@ -436,7 +436,7 @@ static int client_connect(void)
 		goto free;
 	}
 
-	set_options(rs);
+	set_options(rs);// 设置socket 
 
 	if (src_addr) {
 		ret = rai ? rs_bind(rs, rai_src->ai_src_addr, rai_src->ai_src_len) :

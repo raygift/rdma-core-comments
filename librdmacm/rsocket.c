@@ -698,12 +698,16 @@ static int rs_set_nonblocking(struct rsocket *rs, int arg)
 	return ret;
 }
 
+/*
+设置 send queue 和 recv queue 的大小
+确保不超过设备支持的最大queue size 及 RS_QP_MAX_SIZE，且不小于 RS_QP_MIN_SIZE
+*/
 static void rs_set_qp_size(struct rsocket *rs)
 {
 	uint16_t max_size;
 
-	max_size = min(ucma_max_qpsize(rs->cm_id), RS_QP_MAX_SIZE);
-
+	max_size = min(ucma_max_qpsize(rs->cm_id), RS_QP_MAX_SIZE);// max size 设为 设备本身的max qp size 与 RS_QP_MAX_SIZE 中较小的值，保证不超过两者任一
+// 下面将 rs的send queue 和recv queue 大小设为max size 与min zise 之间的值
 	if (rs->sq_size > max_size)
 		rs->sq_size = max_size;
 	else if (rs->sq_size < RS_QP_MIN_SIZE)
@@ -898,7 +902,7 @@ static int rs_create_ep(struct rsocket *rs)
 	struct ibv_qp_init_attr qp_attr;
 	int i, ret;
 
-	rs_set_qp_size(rs);
+	rs_set_qp_size(rs);// 设置rs send queue 及recv queue 的size 不超过最大最小值范围
 	if (rs->cm_id->verbs->device->transport_type == IBV_TRANSPORT_IWARP)
 		rs->opts |= RS_OPT_MSG_SEND;
 	ret = rs_create_cq(rs, rs->cm_id);

@@ -2847,16 +2847,18 @@ void rdma_destroy_ep(struct rdma_cm_id *id)
 
 	rdma_destroy_id(id);
 }
+/*
 
+*/
 int ucma_max_qpsize(struct rdma_cm_id *id)
 {
 	struct cma_id_private *id_priv;
 	struct cma_device *dev;
 	int max_size = 0;
 
-	id_priv = container_of(id, struct cma_id_private, id);
+	id_priv = container_of(id, struct cma_id_private, id);// container_of通过一个结构变量中一个成员的地址找到这个结构体变量的首地址
 	if (id && id_priv->cma_dev) {
-		max_size = id_priv->cma_dev->max_qpsize;
+		max_size = id_priv->cma_dev->max_qpsize;// 获取 rdma 设备的 max qp size
 	} else {
 		ucma_init_all();
 		pthread_mutex_lock(&mut);
