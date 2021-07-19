@@ -707,7 +707,7 @@ static void rs_set_qp_size(struct rsocket *rs)
 	uint16_t max_size;
 
 	max_size = min(ucma_max_qpsize(rs->cm_id), RS_QP_MAX_SIZE);// max size 设为 设备本身的max qp size 与 RS_QP_MAX_SIZE 中较小的值，保证不超过两者任一
-// 下面将 rs的send queue 和recv queue 大小设为max size 与min zise 之间的值
+// 下面将 rs的send queue 和recv queue 大小设为max size 与min size 之间的值
 	if (rs->sq_size > max_size)
 		rs->sq_size = max_size;
 	else if (rs->sq_size < RS_QP_MIN_SIZE)
@@ -746,55 +746,55 @@ static int rs_init_bufs(struct rsocket *rs)
 	uint32_t total_rbuf_size, total_sbuf_size;
 	size_t len;
 
-	rs->rmsg = calloc(rs->rq_size + 1, sizeof(*rs->rmsg));
+	rs->rmsg = calloc(rs->rq_size + 1, sizeof(*rs->rmsg));//在内存中动态地分配 rs->rq_size + 1 个长度为 sizeof(*rs->rmsg) 的连续空间，并将每一个字节都初始化为 0
 	if (!rs->rmsg)
 		return ERR(ENOMEM);
 
-	total_sbuf_size = rs->sbuf_size;
-	if (rs->sq_inline < RS_MAX_CTRL_MSG)
+	total_sbuf_size = rs->sbuf_size;// 获取 rs 的 send buffer 大小，并赋值给total_sbuf_size
+	if (rs->sq_inline < RS_MAX_CTRL_MSG)// TODO：inline 含义于作用？
 		total_sbuf_size += RS_MAX_CTRL_MSG * RS_QP_CTRL_SIZE;
-	rs->sbuf = calloc(total_sbuf_size, 1);
+	rs->sbuf = calloc(total_sbuf_size, 1);// 申请send buffer 内存
 	if (!rs->sbuf)
 		return ERR(ENOMEM);
 
-	rs->smr = rdma_reg_msgs(rs->cm_id, rs->sbuf, total_sbuf_size);
+	rs->smr = rdma_reg_msgs(rs->cm_id, rs->sbuf, total_sbuf_size);// 注册send buffer 对应的send memory region，起始地址为 rs->sbuf，大小为 total_sbuf_size，权限为IBV_ACCESS_LOCAL_WRITE
 	if (!rs->smr)
 		return -1;
 
 	len = sizeof(*rs->target_sgl) * RS_SGL_SIZE +
-	      sizeof(*rs->target_iomap) * rs->target_iomap_size;
-	rs->target_buffer_list = malloc(len);
+	      sizeof(*rs->target_iomap) * rs->target_iomap_size;// 若有iomap，需额外处理。TODO：iomap逻辑尚不清楚
+	rs->target_buffer_list = malloc(len);// 申请send 对应的target buffer 内存
 	if (!rs->target_buffer_list)
 		return ERR(ENOMEM);
 
-	rs->target_mr = rdma_reg_write(rs->cm_id, rs->target_buffer_list, len);
+	rs->target_mr = rdma_reg_write(rs->cm_id, rs->target_buffer_list, len);// 注册send 对应target buffer 的memory region，权限为local write 和remote write
 	if (!rs->target_mr)
 		return -1;
 
 	memset(rs->target_buffer_list, 0, len);
-	rs->target_sgl = rs->target_buffer_list;
+	rs->target_sgl = rs->target_buffer_list;// 将target buffer list 起始地址赋值给 target_sgl
 	if (rs->target_iomap_size)
 		rs->target_iomap = (struct rs_iomap *) (rs->target_sgl + RS_SGL_SIZE);
 
-	total_rbuf_size = rs->rbuf_size;
+	rs->rbuf_size = rs->rbuf_size;// 获取 rs->rbuf_size 的值，并赋值给 total_rbuf_size
 	if (rs->opts & RS_OPT_MSG_SEND)
-		total_rbuf_size += rs->rq_size * RS_MSG_SIZE;
-	rs->rbuf = calloc(total_rbuf_size, 1);
+		total_rbuf_size += rs->rq_size * RS_MSG_SIZE;// 若操作类型为 MSG SEND，则在 rs->rbuf_size 基础上将 total_rbuf_size 加上要发送的单个MSG 大小MSG_SIZE * 要发送的MSG 个数rq_size
+	rs->rbuf = calloc(total_rbuf_size, 1);// 申请 total_rbuf_size 字节的内存空间初始化每字节为0，并将起始地址保存于 rs->rbuf
 	if (!rs->rbuf)
 		return ERR(ENOMEM);
 
-	rs->rmr = rdma_reg_write(rs->cm_id, rs->rbuf, total_rbuf_size);
+	rs->rmr = rdma_reg_write(rs->cm_id, rs->rbuf, total_rbuf_size);// 注册recv 对应的memory region，权限为local write 和remote write
 	if (!rs->rmr)
 		return -1;
 
-	rs->ssgl[0].addr = rs->ssgl[1].addr = (uintptr_t) rs->sbuf;
-	rs->sbuf_bytes_avail = rs->sbuf_size;
-	rs->ssgl[0].lkey = rs->ssgl[1].lkey = rs->smr->lkey;
+	rs->ssgl[0].addr = rs->ssgl[1].addr = (uintptr_t) rs->sbuf;// 将rs->sbuf 赋值给 rs 的send sgl[1].addr ，也赋值给rs 的 send sgl[0].addr
+	rs->sbuf_bytes_avail = rs->sbuf_size;// 将rs->sbuf_size 赋值给 rs send buffer bytes available ，表示rs send buffer 可用字节为sbuf_size 个，可用字节与send buffer 大小一致
+	rs->ssgl[0].lkey = rs->ssgl[1].lkey = rs->smr->lkey;// send sgl[0].local key 与 send sgl[1].local key 都设为send mr local key
 
-	rs->rbuf_free_offset = rs->rbuf_size >> 1;
-	rs->rbuf_bytes_avail = rs->rbuf_size >> 1;
-	rs->sqe_avail = rs->sq_size - rs->ctrl_max_seqno;
-	rs->rseq_comp = rs->rq_size >> 1;
+	rs->rbuf_free_offset = rs->rbuf_size >> 1; // recv buffer free offset 初始化为rbuf_size 的一半
+	rs->rbuf_bytes_avail = rs->rbuf_size >> 1;// rbuf 可用字节数同样初始化为rbuf_size 的一半
+	rs->sqe_avail = rs->sq_size - rs->ctrl_max_seqno;// 可用的send queue element 初始化为 send queue size 减去 rs->ctrl_max_seqno
+	rs->rseq_comp = rs->rq_size >> 1;// recv seqence completion ，赋值为 rq_size 的一半
 	return 0;
 }
 
@@ -857,14 +857,14 @@ static inline int rs_post_recv(struct rsocket *rs)
 	struct ibv_sge sge;
 
 	wr.next = NULL;
-	if (!(rs->opts & RS_OPT_MSG_SEND)) {
+	if (!(rs->opts & RS_OPT_MSG_SEND)) {// iWarp 相关处理
 		wr.wr_id = rs_recv_wr_id(0);
 		wr.sg_list = NULL;
 		wr.num_sge = 0;
-	} else {
-		wr.wr_id = rs_recv_wr_id(rs->rbuf_msg_index);
+	} else {// RoCE 处理
+		wr.wr_id = rs_recv_wr_id(rs->rbuf_msg_index);// 将 recv buffer 位于recv queue 的序号 index 作为work request 的 id
 		sge.addr = (uintptr_t) rs->rbuf + rs->rbuf_size +
-			   (rs->rbuf_msg_index * RS_MSG_SIZE);
+			   (rs->rbuf_msg_index * RS_MSG_SIZE);// recv buffer 起始位置 + 每个recv buffer 大小 + 
 		sge.length = RS_MSG_SIZE;
 		sge.lkey = rs->rmr->lkey;
 
@@ -929,11 +929,11 @@ static int rs_create_ep(struct rsocket *rs)
 	if ((rs->opts & RS_OPT_MSG_SEND) && (rs->sq_inline < RS_MSG_SIZE))
 		return ERR(ENOTSUP);
 
-	ret = rs_init_bufs(rs);
+	ret = rs_init_bufs(rs);// 初始化send/recv buffer，send/recv mr 等
 	if (ret)
 		return ret;
 
-	for (i = 0; i < rs->rq_size; i++) {
+	for (i = 0; i < rs->rq_size; i++) {// 提交多个recv wr，数量与recv queue size 相同
 		ret = rs_post_recv(rs);
 		if (ret)
 			return ret;
@@ -1080,6 +1080,9 @@ static void rs_free(struct rsocket *rs)
 	free(rs);
 }
 
+/*
+返回值为消息中头部连接信息之后的数据起始位置相对于消息起始位置的偏移量
+*/
 static size_t rs_conn_data_offset(struct rsocket *rs)
 {
 	return (rs->cm_id->route.addr.src_addr.sa_family == AF_IB) ?
@@ -1091,22 +1094,22 @@ static void rs_format_conn_data(struct rsocket *rs, struct rs_conn_data *conn)
 	conn->version = 1;
 	conn->flags = RS_CONN_FLAG_IOMAP |
 		      (rs_host_is_net() ? RS_CONN_FLAG_NET : 0);
-	conn->credits = htobe16(rs->rq_size);
+	conn->credits = htobe16(rs->rq_size);// *注意：credits 值为rs recv queue size
 	memset(conn->reserved, 0, sizeof conn->reserved);
 	conn->target_iomap_size = (uint8_t) rs_value_to_scale(rs->target_iomap_size, 8);
 
-	conn->target_sgl.addr = (__force uint64_t)htobe64((uintptr_t) rs->target_sgl);
-	conn->target_sgl.length = (__force uint32_t)htobe32(RS_SGL_SIZE);
-	conn->target_sgl.key = (__force uint32_t)htobe32(rs->target_mr->rkey);
+	conn->target_sgl.addr = (__force uint64_t)htobe64((uintptr_t) rs->target_sgl);// 目标sgl 地址 即为rs 记录的target_sgl
+	conn->target_sgl.length = (__force uint32_t)htobe32(RS_SGL_SIZE);// 目标sgl 长度为2
+	conn->target_sgl.key = (__force uint32_t)htobe32(rs->target_mr->rkey);// 目标mr
 
-	conn->data_buf.addr = (__force uint64_t)htobe64((uintptr_t) rs->rbuf);
-	conn->data_buf.length = (__force uint32_t)htobe32(rs->rbuf_size >> 1);
-	conn->data_buf.key = (__force uint32_t)htobe32(rs->rmr->rkey);
+	conn->data_buf.addr = (__force uint64_t)htobe64((uintptr_t) rs->rbuf);// 将自己接收数据的buffer 地址传递给对端
+	conn->data_buf.length = (__force uint32_t)htobe32(rs->rbuf_size >> 1);//接收数据的buffer 长度赋值为 recv buffer size 的一半，即对端一次只会写满rbuf 的一半
+	conn->data_buf.key = (__force uint32_t)htobe32(rs->rmr->rkey);// 将自己接收数据的buffer 对应的mr 的remote key 传递给对端
 }
 
 static void rs_save_conn_data(struct rsocket *rs, struct rs_conn_data *conn)
 {
-	rs->remote_sgl.addr = be64toh((__force __be64)conn->target_sgl.addr);
+	rs->remote_sgl.addr = be64toh((__force __be64)conn->target_sgl.addr);// 将对端传递的target sgl 信息存储到 remote sgl 中
 	rs->remote_sgl.length = be32toh((__force __be32)conn->target_sgl.length);
 	rs->remote_sgl.key = be32toh((__force __be32)conn->target_sgl.key);
 	rs->remote_sge = 1;
@@ -1121,11 +1124,11 @@ static void rs_save_conn_data(struct rsocket *rs, struct rs_conn_data *conn)
 		rs->remote_iomap.key = rs->remote_sgl.key;
 	}
 
-	rs->target_sgl[0].addr = be64toh((__force __be64)conn->data_buf.addr);
+	rs->target_sgl[0].addr = be64toh((__force __be64)conn->data_buf.addr);// 将对端传递的data buffer 存储到target sgl[0] 中
 	rs->target_sgl[0].length = be32toh((__force __be32)conn->data_buf.length);
 	rs->target_sgl[0].key = be32toh((__force __be32)conn->data_buf.key);
 
-	rs->sseq_comp = be16toh(conn->credits);
+	rs->sseq_comp = be16toh(conn->credits);// send sequence completion 设为对端传递来的值，根据rs_format_conn_data()，此值是对端的rbuf_size 的一半
 }
 
 static int ds_init(struct rsocket *rs, int domain)
@@ -1410,15 +1413,15 @@ resolving_route:
 			break;
 		}
 do_connect:
-		ret = rs_create_ep(rs);// 创建endpoint，包括创建cq ，post_recv
+		ret = rs_create_ep(rs);// 创建endpoint，包括创建cq，初始化buffer 及mr 等 ，并提交rs->rbuf_size 个recv wr
 		if (ret)
 			break;
 
 		memset(&param, 0, sizeof param);
-		creq = (void *) &cdata + rs_conn_data_offset(rs);
-		rs_format_conn_data(rs, creq);
-		param.private_data = (void *) creq - rs_conn_data_offset(rs);
-		param.private_data_len = sizeof(*creq) + rs_conn_data_offset(rs);
+		creq = (void *) &cdata + rs_conn_data_offset(rs);// creq 的值为局部变量cdata 的地址加上消息头部连接信息之后数据部分的偏移量，即消息中conn data数据的起始地址
+		rs_format_conn_data(rs, creq);// 对要发送消息中的连接信息（sgl.addr,sgl_length,sgl rkey）部分进行赋值，同时完成 主机序->网络序的转换
+		param.private_data = (void *) creq - rs_conn_data_offset(rs);// 由于上面将creq 加上conn data偏移量，creq指向了conn data 起始地址，将此地址减去偏移量，再次得到发送消息的起始地址
+		param.private_data_len = sizeof(*creq) + rs_conn_data_offset(rs);// *creq 得到的是conn data，其长度加上消息头部长度即为整个private data 长度
 		param.flow_control = 1;
 		param.retry_count = 7;
 		param.rnr_retry_count = 7;
@@ -1427,9 +1430,9 @@ do_connect:
 			param.initiator_depth = 1;
 		rs->retries = 0;
 
-		ret = rdma_connect(rs->cm_id, &param);
+		ret = rdma_connect(rs->cm_id, &param);// 执行rdma connect，若成功返回0
 		if (!ret)
-			goto connected;
+			goto connected;// 执行rdma connect 成功，转向connected
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			rs->state = rs_connecting;
 		break;
@@ -1438,13 +1441,13 @@ do_connect:
 		if (ret)
 			break;
 connected:
-		cresp = (struct rs_conn_data *) rs->cm_id->event->param.conn.private_data;
+		cresp = (struct rs_conn_data *) rs->cm_id->event->param.conn.private_data;// 获取对端传递来的private data 指针
 		if (cresp->version != 1) {
 			ret = ERR(ENOTSUP);
 			break;
 		}
 
-		rs_save_conn_data(rs, cresp);
+		rs_save_conn_data(rs, cresp);// 保存对端传递来的remote mr，rkey 等信息
 		rs->state = rs_connect_rdwr;
 		break;
 	case rs_accepting:
@@ -1910,7 +1913,7 @@ static void rs_send_credits(struct rsocket *rs)
 	int flags;
 
 	rs->ctrl_seqno++;
-	rs->rseq_comp = rs->rseq_no + (rs->rq_size >> 1);
+	rs->rseq_comp = rs->rseq_no + (rs->rq_size >> 1);// recv sequence number 加 recv queue size 的一半，赋值给recv sequence comp
 	if (rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) {
 		if (rs->opts & RS_OPT_MSG_SEND)
 			rs->ctrl_seqno++;
@@ -1967,11 +1970,12 @@ static inline int rs_2ctrl_avail(struct rsocket *rs)
 
 static int rs_give_credits(struct rsocket *rs)
 {
-	if (!(rs->opts & RS_OPT_MSG_SEND)) {
+	if (!(rs->opts & RS_OPT_MSG_SEND)) {// roce
 		return ((rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) ||
 			((short) ((short) rs->rseq_no - (short) rs->rseq_comp) >= 0)) &&
-		       rs_ctrl_avail(rs) && (rs->state & rs_connected);
-	} else {
+		       rs_ctrl_avail(rs) && (rs->state & rs_connected); //rbuf 可用字节数大于等于 rbuf size 的一半，或者recv sequence number 减去 recv sequence comp 的差大于等于0，
+			   													// 同时ctrl_seqno 不等于ctrl_max_seqno ，同时rs 已经connected
+	} else {// iwarp
 		return ((rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) ||
 			((short) ((short) rs->rseq_no - (short) rs->rseq_comp) >= 0)) &&
 		       rs_2ctrl_avail(rs) && (rs->state & rs_connected);
@@ -1980,7 +1984,7 @@ static int rs_give_credits(struct rsocket *rs)
 
 static void rs_update_credits(struct rsocket *rs)
 {
-	if (rs_give_credits(rs))
+	if (rs_give_credits(rs))// 判断可用recv buffer 是否足够，或者已接受到的seq 序号大于已完成的seq 表明仍有接收但未完成的消息，同时ctrl seqno不能大于上线，且必须是connected 状态
 		rs_send_credits(rs);
 }
 
@@ -2352,7 +2356,7 @@ static int rs_can_send(struct rsocket *rs)
 	if (!(rs->opts & RS_OPT_MSG_SEND)) {
 		return rs->sqe_avail && (rs->sbuf_bytes_avail >= RS_SNDLOWAT) &&
 		       (rs->sseq_no != rs->sseq_comp) &&
-		       (rs->target_sgl[rs->target_sge].length != 0);
+		       (rs->target_sgl[rs->target_sge].length != 0);// 存在可用sqe ，并且可用send buffer 不小于2048，并且send sequence number 不等于send sequeue completion，并且target_sgl[target_sge] 长度不为0
 	} else {
 		return (rs->sqe_avail >= 2) && (rs->sbuf_bytes_avail >= RS_SNDLOWAT) &&
 		       (rs->sseq_no != rs->sseq_comp) &&
@@ -2777,7 +2781,7 @@ ssize_t rsend(int socket, const void *buf, size_t len, int flags)
 	uint32_t xfer_size, olen = RS_OLAP_START_SIZE;
 	int ret = 0;
 
-	rs = idm_at(&idm, socket);
+	rs = idm_at(&idm, socket);// 获取当前socket fd 对应的rsocket 实例
 	if (!rs)
 		return ERR(EBADF);
 	if (rs->type == SOCK_DGRAM) {
@@ -2802,7 +2806,7 @@ ssize_t rsend(int socket, const void *buf, size_t len, int flags)
 		if (ret)
 			goto out;
 	}
-	for (; left; left -= xfer_size, buf += xfer_size) {
+	for (; left; left -= xfer_size, buf += xfer_size) {// 使用left 管理分片
 		if (!rs_can_send(rs)) {
 			ret = rs_get_comp(rs, rs_nonblocking(rs, flags),
 					  rs_conn_can_send);

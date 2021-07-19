@@ -165,7 +165,7 @@ static int send_xfer(int size)
 				return ret;
 		}
 
-		ret = rs_send(rs, buf + offset, size - offset, flags);
+		ret = rs_send(rs, buf + offset, size - offset, flags);// 同步发送，
 		if (ret > 0) {
 			offset += ret;
 		} else if (errno != EWOULDBLOCK && errno != EAGAIN) {
@@ -216,7 +216,7 @@ static int sync_test(void)
 {
 	int ret;
 
-	ret = dst_addr ? send_xfer(16) : recv_xfer(16);
+	ret = dst_addr ? send_xfer(16) : recv_xfer(16);// 存在目标地址，调用send
 	if (ret)
 		return ret;
 
@@ -457,7 +457,7 @@ static int client_connect(void)
 	}
 
 	ret = rai ? rs_connect(rs, rai->ai_dst_addr, rai->ai_dst_len) :
-		    rs_connect(rs, ai->ai_addr, ai->ai_addrlen);// 
+		    rs_connect(rs, ai->ai_addr, ai->ai_addrlen);// 完成buffer 创建、conn data 交换
 	if (ret && (errno != EINPROGRESS)) {
 		perror("rconnect");
 		goto close;
@@ -518,7 +518,7 @@ static int run(void)
 	       "name", "bytes", "xfers", "iters", "total", "time", "Gb/sec", "usec/xfer");
 	if (!custom) { // 没有用户自定义的运行参数
 		optimization = opt_latency;
-		ret = dst_addr ? client_connect() : server_connect(); // 根据dst_addr，分别处理client 和server connect
+		ret = dst_addr ? client_connect() : server_connect(); // 根据dst_addr，分别处理client 和server connect；在connect 后完成了private_data 信息的交换
 		if (ret)
 			goto free;
 
@@ -526,7 +526,7 @@ static int run(void)
 			if (test_size[i].option > size_option)
 				continue;
 			init_latency_test(test_size[i].size);
-			run_test();
+			run_test();// 发送数据执行测试
 		}
 		if (fork_pid)
 			waitpid(fork_pid, NULL, 0);
