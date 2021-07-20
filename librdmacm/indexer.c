@@ -132,7 +132,9 @@ nomem:
 	errno = ENOMEM;
 	return -1;
 }
-
+/*
+ * 将item 插入idm 的array[] 数组中，并返回位于数组的index
+ */
 int idm_set(struct index_map *idm, int index, void *item)
 {
 	void **entry;

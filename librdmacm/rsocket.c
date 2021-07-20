@@ -164,13 +164,13 @@ enum {
 };
 #define rs_msg_set(op, data)  ((op << 29) | (uint32_t) (data))
 #define rs_msg_op(imm_data)   (imm_data >> 29)
-#define rs_msg_data(imm_data) (imm_data & 0x1FFFFFFF)
+#define rs_msg_data(imm_data) (imm_data & 0x1FFFFFFF)/* 将imm_data 高3位设置为0 */
 #define RS_MSG_SIZE	      sizeof(uint32_t)
 
 #define RS_WR_ID_FLAG_RECV (((uint64_t) 1) << 63)
 #define RS_WR_ID_FLAG_MSG_SEND (((uint64_t) 1) << 62) /* See RS_OPT_MSG_SEND */
-#define rs_send_wr_id(data) ((uint64_t) data)
-#define rs_recv_wr_id(data) (RS_WR_ID_FLAG_RECV | (uint64_t) data)
+#define rs_send_wr_id(data) ((uint64_t) data) /* data 高位补0，最高位是0 表示是send wr */
+#define rs_recv_wr_id(data) (RS_WR_ID_FLAG_RECV | (uint64_t) data) /* data 高位补0，最高位设为1 表示是recv wr */
 #define rs_wr_is_recv(wr_id) (wr_id & RS_WR_ID_FLAG_RECV)
 #define rs_wr_is_msg_send(wr_id) (wr_id & RS_WR_ID_FLAG_MSG_SEND)
 #define rs_wr_data(wr_id) ((uint32_t) wr_id)
@@ -551,7 +551,7 @@ static void rs_configure(void)
 	if (init)
 		goto out;
 
-	if (ucma_init()) // 确保存在rdma 设备
+	if (ucma_init()) // 确定存在rdma 设备且支持ib 协议
 		goto out;
 	ucma_ib_init();
 
@@ -857,12 +857,12 @@ static inline int rs_post_recv(struct rsocket *rs)
 	struct ibv_sge sge;
 
 	wr.next = NULL;
-	if (!(rs->opts & RS_OPT_MSG_SEND)) {// iWarp 相关处理
-		wr.wr_id = rs_recv_wr_id(0);
+	if (!(rs->opts & RS_OPT_MSG_SEND)) {// RoCE 相关处理
+		wr.wr_id = rs_recv_wr_id(0);// recv wr 的64 位最高位设为1，低63位都为0
 		wr.sg_list = NULL;
 		wr.num_sge = 0;
-	} else {// RoCE 处理
-		wr.wr_id = rs_recv_wr_id(rs->rbuf_msg_index);// 将 recv buffer 位于recv queue 的序号 index 作为work request 的 id
+	} else {// iwarp 处理
+		wr.wr_id = rs_recv_wr_id(rs->rbuf_msg_index);// 将 recv buffer 位于recv queue 的序号 index 作为work request 的 id，且将其转为64 位无符号整型，最高位设为1 表示为recv wr
 		sge.addr = (uintptr_t) rs->rbuf + rs->rbuf_size +
 			   (rs->rbuf_msg_index * RS_MSG_SIZE);// recv buffer 起始位置 + 每个recv buffer 大小 + 
 		sge.length = RS_MSG_SIZE;
@@ -889,7 +889,7 @@ static inline int ds_post_recv(struct rsocket *rs, struct ds_qp *qp, uint32_t of
 	sge[1].length = RS_SNDLOWAT;
 	sge[1].lkey = qp->rmr->lkey;
 
-	wr.wr_id = rs_recv_wr_id(offset);
+	wr.wr_id = rs_recv_wr_id(offset);// 将32 位offset 扩展为64位，最高位设为1 表示wr 是recv wr
 	wr.next = NULL;
 	wr.sg_list = sge;
 	wr.num_sge = 2;
@@ -903,7 +903,7 @@ static int rs_create_ep(struct rsocket *rs)
 	int i, ret;
 
 	rs_set_qp_size(rs);// 设置rs send queue 及recv queue 的size 不超过最大最小值范围
-	if (rs->cm_id->verbs->device->transport_type == IBV_TRANSPORT_IWARP)
+	if (rs->cm_id->verbs->device->transport_type == IBV_TRANSPORT_IWARP)// 若传输协议为iwarp ，则使用rs->opts 标志将rdma write 改为rdma send
 		rs->opts |= RS_OPT_MSG_SEND;
 	ret = rs_create_cq(rs, rs->cm_id);
 	if (ret)
@@ -1115,7 +1115,7 @@ static void rs_save_conn_data(struct rsocket *rs, struct rs_conn_data *conn)
 	rs->remote_sge = 1;
 	if ((rs_host_is_net() && !(conn->flags & RS_CONN_FLAG_NET)) ||
 	    (!rs_host_is_net() && (conn->flags & RS_CONN_FLAG_NET)))
-		rs->opts = RS_OPT_SWAP_SGL;
+		rs->opts = RS_OPT_SWAP_SGL;// 根据对端传递的flags 提供的是网络序且本机主机序与网络序不同，或者对端传递来的flags 表明不是网络序且本机主机序与网络序相同，将rs->opts 设为SWAP SGL表示需要进行网络序主机序转换
 
 	if (conn->flags & RS_CONN_FLAG_IOMAP) {
 		rs->remote_iomap.addr = rs->remote_sgl.addr +
@@ -1741,7 +1741,7 @@ static int rs_post_msg(struct rsocket *rs, uint32_t msg)
 	struct ibv_send_wr wr, *bad;
 	struct ibv_sge sge;
 
-	wr.wr_id = rs_send_wr_id(msg);
+	wr.wr_id = rs_send_wr_id(msg);// 将无符号32 位整形msg 扩展为64 位，扩展时高位补0，最高位为0 表示是send wr
 	wr.next = NULL;
 	if (!(rs->opts & RS_OPT_MSG_SEND)) {
 		wr.sg_list = NULL;
@@ -1769,7 +1769,7 @@ static int rs_post_write(struct rsocket *rs,
 {
 	struct ibv_send_wr wr, *bad;
 
-	wr.wr_id = rs_send_wr_id(wr_data);
+	wr.wr_id = rs_send_wr_id(wr_data);// wr_id 高位补0，最高位是0 表示是send wr
 	wr.next = NULL;
 	wr.sg_list = sgl;
 	wr.num_sge = nsge;
@@ -1791,18 +1791,18 @@ static int rs_post_write_msg(struct rsocket *rs,
 	int ret;
 
 	wr.next = NULL;
-	if (!(rs->opts & RS_OPT_MSG_SEND)) {
-		wr.wr_id = rs_send_wr_id(msg);
+	if (!(rs->opts & RS_OPT_MSG_SEND)) { // rdma write
+		wr.wr_id = rs_send_wr_id(msg); // 
 		wr.sg_list = sgl;
-		wr.num_sge = nsge;
+		wr.num_sge = nsge;// rs_send_credits() 传入的 nsge 为1
 		wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-		wr.send_flags = flags;
-		wr.imm_data = htobe32(msg);
+		wr.send_flags = flags;// rs_send_credits() 传入的 flags 为0
+		wr.imm_data = htobe32(msg);// 
 		wr.wr.rdma.remote_addr = addr;
 		wr.wr.rdma.rkey = rkey;
 
 		return rdma_seterrno(ibv_post_send(rs->cm_id->qp, &wr, &bad));
-	} else {
+	} else {// rdma send
 		ret = rs_post_write(rs, sgl, nsge, msg, flags, addr, rkey);
 		if (!ret) {
 			wr.wr_id = rs_send_wr_id(rs_msg_set(rs_msg_op(msg), 0)) |
@@ -1912,27 +1912,28 @@ static void rs_send_credits(struct rsocket *rs)
 	struct rs_sge sge, *sge_buf;
 	int flags;
 
-	rs->ctrl_seqno++;
+	rs->ctrl_seqno++;// control msg 序号+1
 	rs->rseq_comp = rs->rseq_no + (rs->rq_size >> 1);// recv sequence number 加 recv queue size 的一半，赋值给recv sequence comp
-	if (rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) {
-		if (rs->opts & RS_OPT_MSG_SEND)
-			rs->ctrl_seqno++;
+													// TODO：原因是否为每次传输的数据量只可能是rq_size/2？
+	if (rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) {//若rbuf 中可用字节数大于rbuf_size
+		if (rs->opts & RS_OPT_MSG_SEND)// 针对iwarp 所用rdma send操作
+			rs->ctrl_seqno++;// control msg 序号+1
 
-		if (!(rs->opts & RS_OPT_SWAP_SGL)) {
-			sge.addr = (uintptr_t) &rs->rbuf[rs->rbuf_free_offset];
-			sge.key = rs->rmr->rkey;
-			sge.length = rs->rbuf_size >> 1;
+		if (!(rs->opts & RS_OPT_SWAP_SGL)) {// 若不需要进行网络序和主机序转换
+			sge.addr = (uintptr_t) &rs->rbuf[rs->rbuf_free_offset];// 将rbuf 空闲空间起始地址赋值给sge.addr
+			sge.key = rs->rmr->rkey;// 将recv mr的remote key 赋值给sge.key
+			sge.length = rs->rbuf_size >> 1;// sge 长度为rbuf_size 的一半
 		} else {
 			sge.addr = bswap_64((uintptr_t) &rs->rbuf[rs->rbuf_free_offset]);
 			sge.key = bswap_32(rs->rmr->rkey);
 			sge.length = bswap_32(rs->rbuf_size >> 1);
 		}
 
-		if (rs->sq_inline < sizeof sge) {
-			sge_buf = rs_get_ctrl_buf(rs);
-			memcpy(sge_buf, &sge, sizeof sge);
-			ibsge.addr = (uintptr_t) sge_buf;
-			ibsge.lkey = rs->smr->lkey;
+		if (rs->sq_inline < sizeof sge) {// 如果send queue inline 数量小于sge 变量大小，表示不使用 IBV_SEND_INLINE 发送？
+			sge_buf = rs_get_ctrl_buf(rs);// 获取control msg buffer 地址
+			memcpy(sge_buf, &sge, sizeof sge);// 将sge 的内容复制到control msg buffer 地址指向的内存中
+			ibsge.addr = (uintptr_t) sge_buf;// 将control msg buffer 地址赋值给 ibsge.addr
+			ibsge.lkey = rs->smr->lkey;// 将send mr 的local key 赋值给ibsge.lkey
 			flags = 0;
 		} else {
 			ibsge.addr = (uintptr_t) &sge;
@@ -1944,15 +1945,19 @@ static void rs_send_credits(struct rsocket *rs)
 		rs_post_write_msg(rs, &ibsge, 1,
 			rs_msg_set(RS_OP_SGL, rs->rseq_no + rs->rq_size), flags,
 			rs->remote_sgl.addr + rs->remote_sge * sizeof(struct rs_sge),
-			rs->remote_sgl.key);
-
-		rs->rbuf_bytes_avail -= rs->rbuf_size >> 1;
-		rs->rbuf_free_offset += rs->rbuf_size >> 1;
-		if (rs->rbuf_free_offset >= rs->rbuf_size)
+			rs->remote_sgl.key);// 执行rdma write，发送内容为控制消息的imm data
+								// 参数1 rsocket 实例，参数2 sgl地址，参数3 sge 个数
+								// 参数4 msg 使用rs_msg_set 设置imm data 的高3位，
+								// 参数5 rdma write 操作对端内存的地址，由对端sgl.addr 加上 remote_sge 记录的次数*单个sge 长度
+								// 参数6 对端remote mr key
+//完成一次rdma write之后，进行recv buffer 可用内存地址更新，可用内存偏移量更新，rdma write 使用的sge 个数更新
+		rs->rbuf_bytes_avail -= rs->rbuf_size >> 1;// rbuf 可用字节减少rbuf_size/2，即一次发送会使用rbuf_size/2 大小的buffer 空间
+		rs->rbuf_free_offset += rs->rbuf_size >> 1;// rbuf free offset 增加rbuf_size/2
+		if (rs->rbuf_free_offset >= rs->rbuf_size) // 当判断可用内存偏移量超过rbuf size 时，重置偏移量，循环使用buffer
 			rs->rbuf_free_offset = 0;
-		if (++rs->remote_sge == rs->remote_sgl.length)
+		if (++rs->remote_sge == rs->remote_sgl.length)// 当判断remote sge达到remote sgl 长度时，重置remote sge
 			rs->remote_sge = 0;
-	} else {
+	} else {// rbuf 中可用字节数小于rbuf_size 的一半，发送
 		rs_post_msg(rs, rs_msg_set(RS_OP_SGL, rs->rseq_no + rs->rq_size));
 	}
 }
@@ -1982,10 +1987,13 @@ static int rs_give_credits(struct rsocket *rs)
 	}
 }
 
+/*
+ * 判断是否可以提供credits，并在可提供时调用ibv_post_send()发送credits
+ */
 static void rs_update_credits(struct rsocket *rs)
 {
 	if (rs_give_credits(rs))// 判断可用recv buffer 是否足够，或者已接受到的seq 序号大于已完成的seq 表明仍有接收但未完成的消息，同时ctrl seqno不能大于上线，且必须是connected 状态
-		rs_send_credits(rs);
+		rs_send_credits(rs);// 准备imm data 并调用ibv_post_send() 执行rdma write
 }
 
 static int rs_poll_cq(struct rsocket *rs)
@@ -1994,27 +2002,27 @@ static int rs_poll_cq(struct rsocket *rs)
 	uint32_t msg;
 	int ret, rcnt = 0;
 
-	while ((ret = ibv_poll_cq(rs->cm_id->recv_cq, 1, &wc)) > 0) {
-		if (rs_wr_is_recv(wc.wr_id)) {
+	while ((ret = ibv_poll_cq(rs->cm_id->recv_cq, 1, &wc)) > 0) {// 如果从recv cq 中获取到了1个 cqe
+		if (rs_wr_is_recv(wc.wr_id)) {// 获取到的事件是recv 的完成事件；通过判断接收到的 wr_id 最高位是否为1，因为wr_id 最高位为0时是发送操作，最高位是1时是接收操作
 			if (wc.status != IBV_WC_SUCCESS)
 				continue;
-			rcnt++;
+			rcnt++;// 如果recv work request 正常完成，recv count 加1
 
-			if (wc.wc_flags & IBV_WC_WITH_IMM) {
-				msg = be32toh(wc.imm_data);
-			} else {
+			if (wc.wc_flags & IBV_WC_WITH_IMM) {// 如果接收到的是write with imm 操作发送的数据
+				msg = be32toh(wc.imm_data);// 将imm data 转为主机序
+			} else {// 否则接收到的是send 操作发送的数据
 				msg = ((uint32_t *) (rs->rbuf + rs->rbuf_size))
-					[rs_wr_data(wc.wr_id)];
+					[rs_wr_data(wc.wr_id)];// 将无符号64位整型强制转换为无符号32位整型，高位数据被舍弃，低32位数据即为发送端发送的数据
 
 			}
 			switch (rs_msg_op(msg)) {
-			case RS_OP_SGL:
-				rs->sseq_comp = (uint16_t) rs_msg_data(msg);
+			case RS_OP_SGL:// 若接收到的消息是SGL 控制消息，即为rs_send_credits() 发送来的credits 信息（rs_msg_set(RS_OP_SGL, rs->rseq_no + rs->rq_size)）
+				rs->sseq_comp = (uint16_t) rs_msg_data(msg);// 根据收到的32位无符号整数msg，将值高3位设为0，然后强制转换为16位无符号整型，存入rs send seq completion 中
 				break;
 			case RS_OP_IOMAP_SGL:
 				/* The iomap was updated, that's nice to know. */
 				break;
-			case RS_OP_CTRL:
+			case RS_OP_CTRL:// 若接收到的消息是CTRL 控制消息
 				if (rs_msg_data(msg) == RS_CTRL_DISCONNECT) {
 					rs->state = rs_disconnected;
 					return 0;
@@ -2037,15 +2045,15 @@ static int rs_poll_cq(struct rsocket *rs)
 					rs->rmsg_tail = 0;
 				break;
 			}
-		} else {
+		} else {// 获取到的wc 是发送操作的完成事件
 			switch  (rs_msg_op(rs_wr_data(wc.wr_id))) {
-			case RS_OP_SGL:
-				rs->ctrl_max_seqno++;
+			case RS_OP_SGL: // 完成credits 发送
+				rs->ctrl_max_seqno++; // 控制信息最大序号加1
 				break;
 			case RS_OP_CTRL:
-				rs->ctrl_max_seqno++;
-				if (rs_msg_data(rs_wr_data(wc.wr_id)) == RS_CTRL_DISCONNECT)
-					rs->state = rs_disconnected;
+				rs->ctrl_max_seqno++; // 控制信息最大序号加1
+				if (rs_msg_data(rs_wr_data(wc.wr_id)) == RS_CTRL_DISCONNECT)// 若发送的控制信息为断开连接
+					rs->state = rs_disconnected;// 修改连接状态
 				break;
 			case RS_OP_IOMAP_SGL:
 				rs->sqe_avail++;
@@ -2053,7 +2061,7 @@ static int rs_poll_cq(struct rsocket *rs)
 					rs->sbuf_bytes_avail += sizeof(struct rs_iomap);
 				break;
 			default:
-				rs->sqe_avail++;
+				rs->sqe_avail++; //
 				rs->sbuf_bytes_avail += rs_msg_data(rs_wr_data(wc.wr_id));
 				break;
 			}
@@ -2063,9 +2071,9 @@ static int rs_poll_cq(struct rsocket *rs)
 			}
 		}
 	}
-
+// 当没有从cq 中获取到cqe 时，
 	if (rs->state & rs_connected) {
-		while (!ret && rcnt--)
+		while (!ret && rcnt--)// ibv_poll_cq 正常返回0 且接收计数rcnt 大于0时，接收计数减1，并提交一次 ibv_post_recv()
 			ret = rs_post_recv(rs);
 
 		if (ret) {
@@ -2119,7 +2127,7 @@ static int rs_process_cq(struct rsocket *rs, int nonblock, int (*test)(struct rs
 
 	fastlock_acquire(&rs->cq_lock);
 	do {
-		rs_update_credits(rs);
+		rs_update_credits(rs);// 发送credits
 		ret = rs_poll_cq(rs);
 		if (test(rs)) {
 			ret = 0;
@@ -2327,6 +2335,9 @@ static int ds_get_comp(struct rsocket *rs, int nonblock, int (*test)(struct rsoc
 	return ret;
 }
 
+/*
+ * return (rs->fd_flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)
+ */
 static int rs_nonblocking(struct rsocket *rs, int flags)
 {
 	return (rs->fd_flags & O_NONBLOCK) || (flags & MSG_DONTWAIT);
@@ -2350,14 +2361,15 @@ static int rs_poll_all(struct rsocket *rs)
  *
  * Be careful with race conditions in the check below.  The target SGL
  * may be updated by a remote RDMA write.
+ * 判断本地target sql 是否存在可用sqe，sbuf_bytes_avail 是否不小于2k，send 序号是否未达到send comp 序号，target_sgl[target_sqe]是否不为空
  */
 static int rs_can_send(struct rsocket *rs)
 {
-	if (!(rs->opts & RS_OPT_MSG_SEND)) {
+	if (!(rs->opts & RS_OPT_MSG_SEND)) {// rdma write
 		return rs->sqe_avail && (rs->sbuf_bytes_avail >= RS_SNDLOWAT) &&
 		       (rs->sseq_no != rs->sseq_comp) &&
 		       (rs->target_sgl[rs->target_sge].length != 0);// 存在可用sqe ，并且可用send buffer 不小于2048，并且send sequence number 不等于send sequeue completion，并且target_sgl[target_sge] 长度不为0
-	} else {
+	} else {// rdma send
 		return (rs->sqe_avail >= 2) && (rs->sbuf_bytes_avail >= RS_SNDLOWAT) &&
 		       (rs->sseq_no != rs->sseq_comp) &&
 		       (rs->target_sgl[rs->target_sge].length != 0);
@@ -2641,7 +2653,7 @@ static int rs_send_iomaps(struct rsocket *rs, int flags)
 		}
 
 		iomr = container_of(rs->iomap_queue.next, struct rs_iomap_mr, entry);
-		if (!(rs->opts & RS_OPT_SWAP_SGL)) {
+		if (!(rs->opts & RS_OPT_SWAP_SGL)) {// 若不需要进行网络序和主机序转换
 			iom.offset = iomr->offset;
 			iom.sge.addr = (uintptr_t) iomr->mr->addr;
 			iom.sge.length = iomr->mr->length;
@@ -2784,7 +2796,7 @@ ssize_t rsend(int socket, const void *buf, size_t len, int flags)
 	rs = idm_at(&idm, socket);// 获取当前socket fd 对应的rsocket 实例
 	if (!rs)
 		return ERR(EBADF);
-	if (rs->type == SOCK_DGRAM) {
+	if (rs->type == SOCK_DGRAM) {// udp
 		fastlock_acquire(&rs->slock);
 		ret = dsend(rs, buf, len, flags);
 		fastlock_release(&rs->slock);
@@ -2806,8 +2818,8 @@ ssize_t rsend(int socket, const void *buf, size_t len, int flags)
 		if (ret)
 			goto out;
 	}
-	for (; left; left -= xfer_size, buf += xfer_size) {// 使用left 管理分片
-		if (!rs_can_send(rs)) {
+	for (; left; left -= xfer_size, buf += xfer_size) {// rs->state 为connected 后，使用left 管理分片
+		if (!rs_can_send(rs)) {// 若不满足发送条件
 			ret = rs_get_comp(rs, rs_nonblocking(rs, flags),
 					  rs_conn_can_send);
 			if (ret)

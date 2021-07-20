@@ -240,6 +240,8 @@ static int check_abi_version(void)
  * This function is called holding the mutex lock
  * cma_dev_list must be not empty before calling this function to
  * ensure that the lock is not acquired recursively.
+ * 通过在RDMA_PS_IB 端口空间创建cm_id 以及将cm_id 与ib 协议socketaddr进行 rdma_bind_addr 来判断是否支持ib 协议
+ * 结果保存在全局变量 af_ib_support 中
  */
 static void ucma_set_af_ib_support(void)
 {
@@ -403,11 +405,11 @@ int ucma_init(void)
 		goto err1;
 	}
 
-	ret = sync_devices_list();
-	if (ret)
+	ret = sync_devices_list();// 同步rdma 设备列表，从列表中删除已不存在的设备，向列表中添加新增设备
+	if (ret)// 在下面调用ucma_set_af_ib_support() 之前，确认cma dev list 不为空
 		goto err1;
 
-	ucma_set_af_ib_support();
+	ucma_set_af_ib_support();// 判断ib 协议支持情况
 	pthread_mutex_unlock(&mut);
 	return 0;
 
