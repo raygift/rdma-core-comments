@@ -857,11 +857,11 @@ static inline int rs_post_recv(struct rsocket *rs)
 	struct ibv_sge sge;
 
 	wr.next = NULL;
-	if (!(rs->opts & RS_OPT_MSG_SEND)) {// RoCE 相关处理
+	if (!(rs->opts & RS_OPT_MSG_SEND)) {// rdma write 相关处理
 		wr.wr_id = rs_recv_wr_id(0);// recv wr 的64 位最高位设为1，低63位都为0
 		wr.sg_list = NULL;
 		wr.num_sge = 0;
-	} else {// iwarp 处理
+	} else {// iwarp rdma send
 		wr.wr_id = rs_recv_wr_id(rs->rbuf_msg_index);// 将 recv buffer 位于recv queue 的序号 index 作为work request 的 id，且将其转为64 位无符号整型，最高位设为1 表示为recv wr
 		sge.addr = (uintptr_t) rs->rbuf + rs->rbuf_size +
 			   (rs->rbuf_msg_index * RS_MSG_SIZE);// recv buffer 起始位置 + 每个recv buffer 大小 + 
@@ -1996,6 +1996,18 @@ static void rs_update_credits(struct rsocket *rs)
 		rs_send_credits(rs);// 准备imm data 并调用ibv_post_send() 执行rdma write
 }
 
+/*
+ * 循环调用ibv_poll_cq() 直到获取不到cqe
+ * 对于获取到的wc 中的cqe，判断完成事件类型（send、recv），判断消息类型（控制消息，数据传输）并分别处理
+ * 针对控制消息
+ * 	1. credits 接收完成事件，会根据发送来的credit 更新rs->sseq_comp
+ * 	2. ctrl 接收完成事件，会根据ctrl 类型更新 rs->state
+ * 	3. credits 发送完成事件，rs->ctrl_max_seqno++
+ * 	4. ctrl 发送完成事件，rs->ctrl_max_seqno++ 且若为disconnect 需更新 rs->state
+ * 针对数据传输
+ * 	1. 数据发送，rs->sqe_avail++ 且rs->sbuf_bytes_avail += sizeof msg
+ * 	2. 数据接受，将消息的op和data 记录到rs-> rmsg 中
+ */
 static int rs_poll_cq(struct rsocket *rs)
 {
 	struct ibv_wc wc;
@@ -2084,6 +2096,11 @@ static int rs_poll_cq(struct rsocket *rs)
 	return ret;
 }
 
+/*
+ * 判断rs->cq_armed，若为0 则返回0
+ * 否则执行ibv_get_cq_event()，从cm_id的recv cq channel 中获得cqe，并将rs->cq_armed 重置为0
+ * 
+ */
 static int rs_get_cq_event(struct rsocket *rs)
 {
 	struct ibv_cq *cq;
@@ -2094,10 +2111,10 @@ static int rs_get_cq_event(struct rsocket *rs)
 		return 0;
 
 	ret = ibv_get_cq_event(rs->cm_id->recv_cq_channel, &cq, &context);
-	if (!ret) {
-		if (++rs->unack_cqe >= rs->sq_size + rs->rq_size) {
-			ibv_ack_cq_events(rs->cm_id->recv_cq, rs->unack_cqe);
-			rs->unack_cqe = 0;
+	if (!ret) {// 执行成功，表示cq channel 中存在cqe 事件
+		if (++rs->unack_cqe >= rs->sq_size + rs->rq_size) {// 若unack_cqe 大于等于 send queue 和 recv queue 队列长度之和
+			ibv_ack_cq_events(rs->cm_id->recv_cq, rs->unack_cqe);// 执行ack 确认所有unack event
+			rs->unack_cqe = 0;// unack 清零
 		}
 		rs->cq_armed = 0;
 	} else if (!(errno == EAGAIN || errno == EINTR)) {
@@ -2125,36 +2142,41 @@ static int rs_process_cq(struct rsocket *rs, int nonblock, int (*test)(struct rs
 {
 	int ret;
 
-	fastlock_acquire(&rs->cq_lock);
+	fastlock_acquire(&rs->cq_lock);// 首先获取 cq_lock ，从而可以获取到cq 中的完成事件
 	do {
 		rs_update_credits(rs);// 发送credits
-		ret = rs_poll_cq(rs);
-		if (test(rs)) {
-			ret = 0;
+		ret = rs_poll_cq(rs); // 循环从cq 中获取cqe，直到获取不到新的cqe；对获取到的cqe 按照不同wr 进行处理；针对recv wc再次提交新的recv wr；
+		if (test(rs)) {// test()函数为 rssend() => rs_get_comp() => rs_process_cq() 传递来的rs_conn_can_send()，判断 rs_can_send(rs) || !(rs->state & rs_writable) 为true
+			ret = 0;// 若 rs 可以执行send 或 rs 状态为不可写，结束循环
 			break;
-		} else if (ret) {
+		} else if (ret) {// 否则 若rs_poll_cq 返回值不为0，结束循环
 			break;
-		} else if (nonblock) {
-			ret = ERR(EWOULDBLOCK);
+		} else if (nonblock) {// 否则 若传入的nonblock 为真，
+			ret = ERR(EWOULDBLOCK);// errno==11，ret==-1
 		} else if (!rs->cq_armed) {
 			ibv_req_notify_cq(rs->cm_id->recv_cq, 0);
 			rs->cq_armed = 1;
-		} else {
-			rs_update_credits(rs);
-			fastlock_acquire(&rs->cq_wait_lock);
-			fastlock_release(&rs->cq_lock);
+		} else {// 否则 在rs 阻塞的情况下
+			rs_update_credits(rs);// 向对端更新credits
+			fastlock_acquire(&rs->cq_wait_lock);// 获取cq_wait_lock，从而可以使用阻塞的方式从cq 中获得完成事件
+			fastlock_release(&rs->cq_lock);// 释放cq_lock，从而其他操作可以从cq 中获取完成事件
 
-			ret = rs_get_cq_event(rs);
-			fastlock_release(&rs->cq_wait_lock);
-			fastlock_acquire(&rs->cq_lock);
+			ret = rs_get_cq_event(rs);// rs是阻塞的，此处阻塞直到从rs->cm_id->recv_cq_channel 中获得cqe，并发送ack
+			fastlock_release(&rs->cq_wait_lock);// 释放cq_wait_lock，不再使用阻塞的方式等待从cq 获得完成事件
+			fastlock_acquire(&rs->cq_lock);// 重新申请cq_lock ，方便循环外统一进行release 操作
 		}
-	} while (!ret);
+	} while (!ret);// ret 为0时，持续循环
 
-	rs_update_credits(rs);
+	rs_update_credits(rs);// 向对端更新rbuf 状态
 	fastlock_release(&rs->cq_lock);
 	return ret;
 }
 
+/*
+ * 在polling_time 限定时间内不断循环执行rs_process_cq()
+ * rs_process_cq() 中执行 rs_poll_cq() ，并在执行正常结束后不断循环执行；直到 rs_poll_cq() 或ibv_ack_cq_events() 执行出错，或者传入参数为nonblock==1且 rs_poll_cq() 返回0
+ * rs_poll_cq() 中循环执行 ibv_poll_cq()，在获取不到cqe 后返回；对于获取到的cqe 根据imm data 32位所传递的op、data 不同类型分别处理
+ */
 static int rs_get_comp(struct rsocket *rs, int nonblock, int (*test)(struct rsocket *rs))
 {
 	uint64_t start_time = 0;
@@ -2162,7 +2184,7 @@ static int rs_get_comp(struct rsocket *rs, int nonblock, int (*test)(struct rsoc
 	int ret;
 
 	do {
-		ret = rs_process_cq(rs, 1, test);
+		ret = rs_process_cq(rs, 1, test);// 执行ibv_poll_cq() ，并在返回0时继续循环执行；由于nonblock，因此ibv_poll_cq()==0 且rs_conn_can_send() 为false 时，不会阻塞等待ibv_get_cq_event()，而是直接退出
 		if (!ret || nonblock || errno != EWOULDBLOCK)
 			return ret;
 
@@ -2170,9 +2192,9 @@ static int rs_get_comp(struct rsocket *rs, int nonblock, int (*test)(struct rsoc
 			start_time = rs_time_us();
 
 		poll_time = (uint32_t) (rs_time_us() - start_time);
-	} while (poll_time <= polling_time);
+	} while (poll_time <= polling_time);// pollint_time 时间段内持续循环执行 rs_process_cq
 
-	ret = rs_process_cq(rs, 0, test);
+	ret = rs_process_cq(rs, 0, test);// 超过polling_time 后，再执行一次ibv_poll_cq() ，本次执行完后可能进入阻塞情况下等待ibv_get_cq_event() 返回的情况
 	return ret;
 }
 
@@ -2385,7 +2407,9 @@ static int ds_all_sends_done(struct rsocket *rs)
 {
 	return rs->sqe_avail == rs->sq_size;
 }
-
+/*
+ * 	return rs_can_send(rs) || !(rs->state & rs_writable);
+ */
 static int rs_conn_can_send(struct rsocket *rs)
 {
 	return rs_can_send(rs) || !(rs->state & rs_writable);
@@ -2494,13 +2518,13 @@ static ssize_t rs_peek(struct rsocket *rs, void *buf, size_t len)
 
 		end_size = rs->rbuf_size - rbuf_offset;
 		if (rsize > end_size) {
-			memcpy(buf, &rs->rbuf[rbuf_offset], end_size);
+			memcpy(buf, &rs->rbuf[rbuf_offset], end_size);//TODO
 			rbuf_offset = 0;
 			buf += end_size;
 			rsize -= end_size;
 			left -= end_size;
 		}
-		memcpy(buf, &rs->rbuf[rbuf_offset], rsize);
+		memcpy(buf, &rs->rbuf[rbuf_offset], rsize);//TODO
 		rbuf_offset += rsize;
 		buf += rsize;
 	}
@@ -2563,14 +2587,14 @@ ssize_t rrecv(int socket, void *buf, size_t len, int flags)
 
 			end_size = rs->rbuf_size - rs->rbuf_offset;
 			if (rsize > end_size) {
-				memcpy(buf, &rs->rbuf[rs->rbuf_offset], end_size);
+				memcpy(buf, &rs->rbuf[rs->rbuf_offset], end_size);// TODO
 				rs->rbuf_offset = 0;
 				buf += end_size;
 				rsize -= end_size;
 				left -= end_size;
 				rs->rbuf_bytes_avail += end_size;
 			}
-			memcpy(buf, &rs->rbuf[rs->rbuf_offset], rsize);
+			memcpy(buf, &rs->rbuf[rs->rbuf_offset], rsize);// TODO
 			rs->rbuf_offset += rsize;
 			buf += rsize;
 			rs->rbuf_bytes_avail += rsize;
@@ -2821,11 +2845,11 @@ ssize_t rsend(int socket, const void *buf, size_t len, int flags)
 	for (; left; left -= xfer_size, buf += xfer_size) {// rs->state 为connected 后，使用left 管理分片
 		if (!rs_can_send(rs)) {// 若不满足发送条件
 			ret = rs_get_comp(rs, rs_nonblocking(rs, flags),
-					  rs_conn_can_send);
+					  rs_conn_can_send);// 获取recv cq channel 中的完成事件并进行处理
 			if (ret)
 				break;
-			if (!(rs->state & rs_writable)) {
-				ret = ERR(ECONNRESET);
+			if (!(rs->state & rs_writable)) {// 若rs 不可写
+				ret = ERR(ECONNRESET);// 将errno 设为 ECONNRESET 连接已被重置
 				break;
 			}
 		}
@@ -2849,7 +2873,7 @@ ssize_t rsend(int socket, const void *buf, size_t len, int flags)
 			sge.lkey = 0;
 			ret = rs_write_data(rs, &sge, 1, xfer_size, IBV_SEND_INLINE);
 		} else if (xfer_size <= rs_sbuf_left(rs)) {
-			memcpy((void *) (uintptr_t) rs->ssgl[0].addr, buf, xfer_size);
+			memcpy((void *) (uintptr_t) rs->ssgl[0].addr, buf, xfer_size);// TODO
 			rs->ssgl[0].length = xfer_size;
 			ret = rs_write_data(rs, rs->ssgl, 1, xfer_size, 0);
 			if (xfer_size < rs_sbuf_left(rs))
@@ -2859,9 +2883,9 @@ ssize_t rsend(int socket, const void *buf, size_t len, int flags)
 		} else {
 			rs->ssgl[0].length = rs_sbuf_left(rs);
 			memcpy((void *) (uintptr_t) rs->ssgl[0].addr, buf,
-				rs->ssgl[0].length);
+				rs->ssgl[0].length);// TODO
 			rs->ssgl[1].length = xfer_size - rs->ssgl[0].length;
-			memcpy(rs->sbuf, buf + rs->ssgl[0].length, rs->ssgl[1].length);
+			memcpy(rs->sbuf, buf + rs->ssgl[0].length, rs->ssgl[1].length);// TODO
 			ret = rs_write_data(rs, rs->ssgl, 2, xfer_size, 0);
 			rs->ssgl[0].addr = (uintptr_t) rs->sbuf + rs->ssgl[1].length;
 		}
