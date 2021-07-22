@@ -331,38 +331,38 @@ struct rsocket {
 			struct rdma_cm_id *cm_id;
 			uint64_t	  tcp_opts;
 			unsigned int	  keepalive_time;
-			int		  accept_queue[2];
+			int		  accept_queue[2];// 记录server 已完成rdma_accept() 的agent
 
-			unsigned int	  ctrl_seqno;
-			unsigned int	  ctrl_max_seqno;
-			uint16_t	  sseq_no;
-			uint16_t	  sseq_comp;
+			unsigned int	  ctrl_seqno; // 记录当前ctrl 消息的序号
+			unsigned int	  ctrl_max_seqno;// rsocket 创建时初始化为4
+			uint16_t	  sseq_no;// 发送消息的序号，每执行一次发送（send/write），序号加1
+			uint16_t	  sseq_comp;// send squence completion
 			uint16_t	  rseq_no;
-			uint16_t	  rseq_comp;
+			uint16_t	  rseq_comp;// recv seqence completion ，赋值为 rq_size 的一半
 
-			int		  remote_sge;
+			int		  remote_sge;// 接收到对端连接信息时，将对应remote_sge 初始设为1，后续调用rs_send_credits() 时递增+1；当增长到 remote_sql.length 时重置为0，循环使用
 			struct rs_sge	  remote_sgl;
 			struct rs_sge	  remote_iomap;
 
-			struct ibv_mr	  *target_mr;
-			int		  target_sge;
+			struct ibv_mr	  *target_mr;// 本机注册target_buffer_list对应target_mr
+			int		  target_sge;// 记录使用的target_sql 中元素的序号，target_sgl 长度为2，因此序号为0或1
 			int		  target_iomap_size;
-			void		  *target_buffer_list;
-			volatile struct rs_sge	  *target_sgl;
+			void		  *target_buffer_list;// 本机申请target_buffer_list
+			volatile struct rs_sge	  *target_sgl;// 本机将target_sgl 初始化为target_buffer_list地址；将建立连接时收到的对端remote buffer信息存储在target_sql[0]
 			struct rs_iomap   *target_iomap;
 
-			int		  rbuf_msg_index;
-			int		  rbuf_bytes_avail;
-			int		  rbuf_free_offset;
-			int		  rbuf_offset;
+			int		  rbuf_msg_index;// recv buffer msg index，msg 位于recv buffer 的位置
+			int		  rbuf_bytes_avail;// recv bffer 中可用的字节数
+			int		  rbuf_free_offset;//recv buffer 空闲空间的起始偏移量
+			int		  rbuf_offset;// recv buffer 偏移量
 			struct ibv_mr	  *rmr;
 			uint8_t		  *rbuf;
 
-			int		  sbuf_bytes_avail;
+			int		  sbuf_bytes_avail;// send buffer 中可用的字节数，rs_init_bufs初始时为 sbuf_size；rs_poll_cq() 中获得发送数据消息的完成事件后，sbuf_bytes_avail 增加已完成发送的数据长度；每执行一次发送，需要减去发送的数据长度
 			struct ibv_mr	  *smr;
-			struct ibv_sge	  ssgl[2];
+			struct ibv_sge	  ssgl[2];// send sgl，包含两个ibv_sge元素，记录了addr,length,lkey；初始时两个元素的addr 均在rs_init_bufs() 中被设为sbuf起始地址；在rs_sbuf_left() 中使用 rs->sbuf[rs->sbuf_size] 地址减去ssgl[0].addr 得到send buf 中未发送的长度
 		};
-		/* datagram */
+    		/* datagram */
 		struct {
 			struct ds_qp	  *qp_list;
 			void		  *dest_map;
@@ -382,30 +382,34 @@ struct rsocket {
 	void		  *optval;
 	size_t		  optlen;
 	int		  state;
-	int		  cq_armed;
+	int		  cq_armed;// 标识cq 是否被执行过ibv_req_notify_cq()；若为执行过，在rs_process_cq()中执行并将cq_armed设为1
 	int		  retries;
 	int		  err;
 
-	int		  sqe_avail;
-	uint32_t	  sbuf_size;
-	uint16_t	  sq_size;
+	int		  sqe_avail;// 获取数据（而非控制）消息发送完成事件后，sqe_avail 加1；每执行一次数据发送，sqe_avail减1；每执行一次rdma send，sqe_avail 额外再减1
+	uint32_t	  sbuf_size;// send buffer 大小，单位为字节，rs_alloc()中被初始化为1 << 17，在rs_init_bufs() 中初始时会据此申请send mr
+	uint16_t	  sq_size;// 
 	uint16_t	  sq_inline;
 
-	uint32_t	  rbuf_size;
+	uint32_t	  rbuf_size;// 初始设为 1<<17
+  // recv queue size，接收队列大小，初始在rs_alloc被设为384；
+  // 在rs_set_qp_size() 被设为不大于rdma 设备的 max_qp_wr；
+  // 且rbuf_msg_index 不应大于此大小；
+  // msg 为recv queue 中的元素；recv buffer = rq size *RS_MSG_SIZE
 	uint16_t	  rq_size;
-	int		  rmsg_head;
-	int		  rmsg_tail;
+	int		  rmsg_head;//
+	int		  rmsg_tail;// 最后一个接收到的msg 位于rmsg 中的索引；若tail 增长到rq_size+1,则重置为0
 	union {
-		struct rs_msg	  *rmsg;
+		struct rs_msg	  *rmsg;// 指向所有rs_msg 起始地址的指针
 		struct ds_rmsg	  *dmsg;
 	};
 
-	uint8_t		  *sbuf;
+	uint8_t		  *sbuf;// sbuf 指向send buffer 的起始地址；由于需存储ctrl 消息，在rs_init_bufs() 中分配的send buffer 大小可能会比sbuf_size 要更大
 	struct rs_iomap_mr *remote_iomappings;
 	dlist_entry	  iomap_list;
 	dlist_entry	  iomap_queue;
 	int		  iomap_pending;
-	int		  unack_cqe;
+	int		  unack_cqe;// rs_get_cq_event()执行ibv_get_cq_event()正常返回后，unack_cqe加1；
 };
 
 #define DS_UDP_TAG 0x55555555
