@@ -2068,8 +2068,8 @@ static int rs_poll_cq(struct rsocket *rs)
 				/* We really shouldn't be here. */
 				break;
 			default:
-				rs->rmsg[rs->rmsg_tail].op = rs_msg_op(msg);
-				rs->rmsg[rs->rmsg_tail].data = rs_msg_data(msg);
+				rs->rmsg[rs->rmsg_tail].op = rs_msg_op(msg); 
+				rs->rmsg[rs->rmsg_tail].data = rs_msg_data(msg); //将收到的imm data 存入rmsg
 				if (++rs->rmsg_tail == rs->rq_size + 1)
 					rs->rmsg_tail = 0;
 				break;
@@ -2163,7 +2163,8 @@ static int rs_process_cq(struct rsocket *rs, int nonblock, int (*test)(struct rs
 	do {
 		rs_update_credits(rs);// 发送credits
 		ret = rs_poll_cq(rs); // 循环从cq 中获取cqe，直到获取不到新的cqe；对获取到的cqe 按照不同wr 进行处理；针对recv wc再次提交新的recv wr；
-		if (test(rs)) {// test()函数为 rssend() => rs_get_comp() => rs_process_cq() 传递来的rs_conn_can_send()，判断 rs_can_send(rs) || !(rs->state & rs_writable) 为true
+		if (test(rs)) {// test()函数为 rssend() => rs_get_comp() => rs_process_cq() 传递来的rs_conn_can_send()，判断 rs_can_send(rs) || !(rs->state & rs_writable) ，有数据可发送，或者rs 不可写时，正常退出
+					   // rrecv() => rs_get_comp() => rs_process_cq() 传递来的 rs_conn_have_rdata()，判断 rs_have_rdata(rs) || !(rs->state & rs_readable)，有已接收的数据需要处理，或者rs 不可读时，正常退出
 			ret = 0;// 若 rs 可以执行send 或 rs 状态为不可写，结束循环
 			break;
 		} else if (ret) {// 否则 若rs_poll_cq 返回值不为0，结束循环
@@ -2437,6 +2438,9 @@ static int rs_conn_can_send_ctrl(struct rsocket *rs)
 	return rs_ctrl_avail(rs) || !(rs->state & rs_connected);
 }
 
+/*
+ * (rs->rmsg_head != rs->rmsg_tail)
+ */
 static int rs_have_rdata(struct rsocket *rs)
 {
 	return (rs->rmsg_head != rs->rmsg_tail);
@@ -2562,15 +2566,15 @@ ssize_t rrecv(int socket, void *buf, size_t len, int flags)
 	rs = idm_at(&idm, socket);
 	if (!rs)
 		return ERR(EBADF);
-	if (rs->type == SOCK_DGRAM) {
+	if (rs->type == SOCK_DGRAM) { // 处理udp
 		fastlock_acquire(&rs->rlock);
 		ret = ds_recvfrom(rs, buf, len, flags, NULL, NULL);
 		fastlock_release(&rs->rlock);
 		return ret;
 	}
 
-	if (rs->state & rs_opening) {
-		ret = rs_do_connect(rs);
+	if (rs->state & rs_opening) { // 若尚未完成连接
+		ret = rs_do_connect(rs); // 建立连接
 		if (ret) {
 			if (errno == EINPROGRESS)
 				errno = EAGAIN;
@@ -2579,45 +2583,45 @@ ssize_t rrecv(int socket, void *buf, size_t len, int flags)
 	}
 	fastlock_acquire(&rs->rlock);
 	do {
-		if (!rs_have_rdata(rs)) {
+		if (!rs_have_rdata(rs)) { // 判断rmsg 中是否有接收到的imm data，若没有数据，执行 rs_poll_cq() 获取接收完成事件，并将数据存入rmsg
 			ret = rs_get_comp(rs, rs_nonblocking(rs, flags),
 					  rs_conn_have_rdata);
 			if (ret)
 				break;
 		}
 
-		if (flags & MSG_PEEK) {
+		if (flags & MSG_PEEK) { // rstream.c 传递来的flags 为 MSG_DONTWAIT 值为 0x40 ,MSG_PEEK 值为 0x02
 			left = len - rs_peek(rs, buf, left);
 			break;
 		}
 
-		for (; left && rs_have_rdata(rs); left -= rsize) {
-			if (left < rs->rmsg[rs->rmsg_head].data) {
+		for (; left && rs_have_rdata(rs); left -= rsize) {// 当left 不为0 且rmsg 中有msg 需要处理时，执行循环
+			if (left < rs->rmsg[rs->rmsg_head].data) { // rsize 设为left 和rmsg[rms_head].data 中较小值
 				rsize = left;
-				rs->rmsg[rs->rmsg_head].data -= left;
+				rs->rmsg[rs->rmsg_head].data -= left; // rmsg[].data 减小left
 			} else {
-				rs->rseq_no++;
+				rs->rseq_no++; // recv 序号 加1
 				rsize = rs->rmsg[rs->rmsg_head].data;
-				if (++rs->rmsg_head == rs->rq_size + 1)
+				if (++rs->rmsg_head == rs->rq_size + 1) // rmsg_head 向后移动，当移到rmsg 末尾时，重置为0
 					rs->rmsg_head = 0;
 			}
 
-			end_size = rs->rbuf_size - rs->rbuf_offset;
-			if (rsize > end_size) {
-				memcpy(buf, &rs->rbuf[rs->rbuf_offset], end_size);// TODO
-				rs->rbuf_offset = 0;
-				buf += end_size;
-				rsize -= end_size;
-				left -= end_size;
-				rs->rbuf_bytes_avail += end_size;
+			end_size = rs->rbuf_size - rs->rbuf_offset; // TODO: rs->rbuf_offset 什么时候完成了初始化？假设其未进行初始化，假设未赋值的int 变量为0，那么end_size 等于 rbuf_size
+			if (rsize > end_size) {// do wihle 第一次执行时到此处时，rsize 代表本轮循环全部要接收的数据大小，若rsize 大于 rbuf_size，需要首先将rbuf 装满，然后从rbuf 起始地址继续填充剩余数据
+				memcpy(buf, &rs->rbuf[rs->rbuf_offset], end_size);// 将rbuf 一部分内容从buf 当前offset 向后填满
+				rs->rbuf_offset = 0; // 重置offset 为0
+				buf += end_size;// 全部待接收数据的前end_size 字节已经赋值到buf 中，buf 指针后移动
+				rsize -= end_size; // 本次要接收数据长度减去已完成复制的数据长度
+				left -= end_size; // 全部待接收数据长度减去已完成复制的数据长度
+				rs->rbuf_bytes_avail += end_size; // rbuf 中长度为end_size 的数据被复制到buf，此部分数据占用的空间变为可用状态
 			}
-			memcpy(buf, &rs->rbuf[rs->rbuf_offset], rsize);// TODO
-			rs->rbuf_offset += rsize;
-			buf += rsize;
-			rs->rbuf_bytes_avail += rsize;
+			memcpy(buf, &rs->rbuf[rs->rbuf_offset], rsize);// 从rbuf 起始位置复制长度为rsize 的数据到buf 中
+			rs->rbuf_offset += rsize; // 移动rbuf 中待复制数据的偏移量
+			buf += rsize;// buf 指针向后移动
+			rs->rbuf_bytes_avail += rsize; // rbuf 可用字节数增加
 		}
 
-	} while (left && (flags & MSG_WAITALL) && (rs->state & rs_readable));
+	} while (left && (flags & MSG_WAITALL) && (rs->state & rs_readable));// 当 left 不为0 且 flags 为 MSG_WAITALL 且 rs可读时，循环进行数据复制；MSG_WAITALL 只能在阻塞模式时使用，进行循环读；参考 socket recv(sockfd, buff, buff_size, MSG_WAITALL)
 
 	fastlock_release(&rs->rlock);
 	return (ret && left == len) ? ret : len - left;
