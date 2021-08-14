@@ -2004,7 +2004,8 @@ static int rs_give_credits(struct rsocket *rs)
 	if (!(rs->opts & RS_OPT_MSG_SEND)) {// roce
 		return ((rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) ||
 			((short) ((short) rs->rseq_no - (short) rs->rseq_comp) >= 0)) &&
-		       rs_ctrl_avail(rs) && (rs->state & rs_connected); //rbuf 可用字节数大于等于 rbuf size 的一半，或者recv sequence number 减去 recv sequence comp 的差大于等于0，
+		       rs_ctrl_avail(rs) && (rs->state & rs_connected); // rbuf 可用字节数大于等于 rbuf size 的一半							// 表示recv buf 中可用空间超过了每次传输需要使用的空间，有1个sge 大小的空间可用了
+			   													// 或者recv sequence number 减去 recv sequence comp 的差大于等于0， // 表示
 			   													// 同时ctrl_seqno 不等于ctrl_max_seqno ，同时rs 已经connected
 	} else {// iwarp
 		return ((rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) ||
@@ -2571,7 +2572,7 @@ static ssize_t rs_peek(struct rsocket *rs, void *buf, size_t len)
 ssize_t rrecv(int socket, void *buf, size_t len, int flags)
 {
 	struct rsocket *rs;
-	size_t left = len;
+	size_t left = len;// left 为调用rrecv 时传入的可读取数据长度，表示调用方本次可接收的数据最大长度
 	uint32_t end_size, rsize;
 	int ret = 0;
 
@@ -2607,27 +2608,34 @@ ssize_t rrecv(int socket, void *buf, size_t len, int flags)
 			break;
 		}
 
-		for (; left && rs_have_rdata(rs); left -= rsize) {// 当left 不为0 且rmsg 中有msg 需要处理时，执行循环
-			if (left < rs->rmsg[rs->rmsg_head].data) { // rsize 设为left 和rmsg[rms_head].data 中较小值
+		for (; left && rs_have_rdata(rs); left -= rsize) {// 当可接收的数据长度left 不为0 且rmsg 中仍然有msg 需要处理时，执行循环；使用rsize 记录每次循环读取到的数据长度，因此每次循环时需要更新可接收的数据长度left；
+			if (left < rs->rmsg[rs->rmsg_head].data) { // 由于rmsg 队列中元素的data 值存储的是【数据长度】，每次读取只能读取 left 和rmsg[].data 中的较小值；若当前left 值小于rmsg 队列头部元素的data 的值，则将较小的left 赋值给rsize，rsize 用来记录本次读取的数据长度
 				rsize = left;
-				rs->rmsg[rs->rmsg_head].data -= left; // rmsg[].data 减小left
-			} else {
-				rs->rseq_no++; // recv 序号 加1
+				rs->rmsg[rs->rmsg_head].data -= left; // rmsg[].data 由于大于了可读取的left 的长度，因此仍剩余 rmsg[].data -left 的数据未被读取，将剩余长度记录到rmsg[].data 中，下次继续读取
+			} else {// 否则本次可读取的长度 大于 rmsg[].data 中记录的数据长度，因此本地读取数据长度就采用 rmsg[].data 的值，用rsize 记录本地读取的数据长度
+				rs->rseq_no++; // recv 序号 加1，表示已处理完的rmsg 元素总个数 加1
 				rsize = rs->rmsg[rs->rmsg_head].data;
-				if (++rs->rmsg_head == rs->rq_size + 1) // rmsg_head 向后移动，当移到rmsg 末尾时，重置为0
+				if (++rs->rmsg_head == rs->rq_size + 1) // rmsg_head 向后移动，当大小等于rq_size 时，重置为0；
 					rs->rmsg_head = 0;
 			}
 
-			end_size = rs->rbuf_size - rs->rbuf_offset; // TODO: rs->rbuf_offset 什么时候完成了初始化？假设其未进行初始化，假设未赋值的int 变量为0，那么end_size 等于 rbuf_size
-			if (rsize > end_size) {// do wihle 第一次执行时到此处时，rsize 代表本轮循环全部要接收的数据大小，若rsize 大于 rbuf_size，需要首先将rbuf 装满，然后从rbuf 起始地址继续填充剩余数据
-				memcpy(buf, &rs->rbuf[rs->rbuf_offset], end_size);// 将rbuf 一部分内容从buf 当前offset 向后填满
+			end_size = rs->rbuf_size - rs->rbuf_offset; // end_size 记录了rbuf_offset 位置之后的数据长度；
+			// [-------------------------------------] rbuf
+			// |<--------- rbuf_size --------------->|
+			//      ⬆
+			// rbuf_offset（此处只是为了说明offset 是指示 rbuf 中待复制到 buf 的数据的位置偏移量，注意rbuf_offset 并非指针）
+			//      |<--------- end_size ----------->|
+			// 
+			// TODO: rs->rbuf_offset 什么时候完成了初始化？假设其未进行初始化，假设未赋值的int 变量为0，那么end_size 等于 rbuf_size
+			if (rsize > end_size) {		// do wihle 第一次执行时到此处时，rsize 代表本轮循环全部要接收的数据大小，若rsize 大于 rbuf_size，需要首先将rbuf 装满，然后从rbuf 起始地址继续填充剩余数据
+				memcpy(buf, &rs->rbuf[rs->rbuf_offset], end_size);// 将rbuf 中当前offset 之后的数据赋值到接送数据的buf 中，数据长度为end_size
 				rs->rbuf_offset = 0; // 重置offset 为0
-				buf += end_size;// 全部待接收数据的前end_size 字节已经赋值到buf 中，buf 指针后移动
-				rsize -= end_size; // 本次要接收数据长度减去已完成复制的数据长度
-				left -= end_size; // 全部待接收数据长度减去已完成复制的数据长度
+				buf += end_size;	 // 接收数据的buf 已接收到end_size 大小的数据，指针后移动以便继续后续赋值
+				rsize -= end_size; 	 // 本次要接收数据长度减去已完成复制的数据长度，rsize 记录的为本次循环还可以接受的数据长度
+				left -= end_size;    // 全部可接收数据长度减去已完成复制的数据长度
 				rs->rbuf_bytes_avail += end_size; // rbuf 中长度为end_size 的数据被复制到buf，此部分数据占用的空间变为可用状态
 			}
-			memcpy(buf, &rs->rbuf[rs->rbuf_offset], rsize);// 从rbuf 起始位置复制长度为rsize 的数据到buf 中
+			memcpy(buf, &rs->rbuf[rs->rbuf_offset], rsize);// 若上面if 条件不满足，则rsize < end_size ，本次循环直接接收rsize 大小的数据；否则，在接受完end_size 大小的数据之后，继续从rbuf 起始位置接收大小为（本次循环可接受长度-已接受的end_size 长度，即上面if 中rsize更新后的值）的数据到buf 中
 			rs->rbuf_offset += rsize; // 移动rbuf 中待复制数据的偏移量
 			buf += rsize;// buf 指针向后移动
 			rs->rbuf_bytes_avail += rsize; // rbuf 可用字节数增加
