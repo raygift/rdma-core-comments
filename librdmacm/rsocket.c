@@ -1111,6 +1111,8 @@ static void rs_format_conn_data(struct rsocket *rs, struct rs_conn_data *conn)
 	conn->data_buf.addr = (__force uint64_t)htobe64((uintptr_t) rs->rbuf);// 将自己接收数据的buffer 地址传递给对端
 	conn->data_buf.length = (__force uint32_t)htobe32(rs->rbuf_size >> 1);//接收数据的buffer 长度赋值为 recv buffer size 的一半，即对端一次只会写满rbuf 的一半
 	conn->data_buf.key = (__force uint32_t)htobe32(rs->rmr->rkey);// 将自己接收数据的buffer 对应的mr 的remote key 传递给对端
+	// printf("sizeof rs_conn_data %ld\n",sizeof(struct rs_conn_data));
+	// printf("sizeof conn %ld\n",sizeof(conn));
 }
 
 static void rs_save_conn_data(struct rsocket *rs, struct rs_conn_data *conn)
@@ -1326,7 +1328,10 @@ static void rs_accept(struct rsocket *rs)
 	rs_format_conn_data(new_rs, &cresp);// 将agent 的buffer 信息发送给client
 	param.private_data = &cresp;
 	param.private_data_len = sizeof cresp;
+	//printf("sizeof cresp %ld\n",sizeof cresp);
+	//printf("before rdma_accept(new_rs->cm_id, &param); fcntl %u, O_NONBLOCK %u\n",fcntl(new_rs->cm_id->channel->fd,F_GETFL),O_NONBLOCK),;
 	ret = rdma_accept(new_rs->cm_id, &param);
+	//printf("fcntl %u\n",fcntl(new_rs->cm_id->channel->fd,F_GETFL));
 // rdma_accept 执行之后 param 的private_data 被写入到 new_rs->cm_id->channel->fd 中
 	if (!ret)
 		new_rs->state = rs_connect_rdwr;
@@ -1976,8 +1981,8 @@ static void rs_send_credits(struct rsocket *rs)
 		rs->rbuf_free_offset += rs->rbuf_size >> 1;// rbuf free offset 增加rbuf_size/2
 		if (rs->rbuf_free_offset >= rs->rbuf_size) // 当判断可用内存偏移量超过rbuf size 时，重置偏移量，循环使用buffer
 			rs->rbuf_free_offset = 0;
-		if (++rs->remote_sge == rs->remote_sgl.length)// 当判断remote sge达到remote sgl 长度时，重置remote sge
-			rs->remote_sge = 0;
+		if (++rs->remote_sge == rs->remote_sgl.length)// 每次向对端更新完自己接收缓冲rbuf 的状态，切换一个sge，将另一部分内存供对方继续进行写入
+			rs->remote_sge = 0;// 当判断remote sge达到remote sgl 长度时，重置remote sge；目的是轮询使用两个sge
 	} else {// rbuf 中可用字节数小于rbuf_size 的一半，发送
 		rs_post_msg(rs, rs_msg_set(RS_OP_SGL, rs->rseq_no + rs->rq_size));
 	}
@@ -2072,6 +2077,9 @@ static int rs_poll_cq(struct rsocket *rs)
 				/* We really shouldn't be here. */
 				break;
 			default:
+				// printf tcp_msg_op(msg) 得到 无符号整数 0，表示TCP_OP_DATA；
+				// printf msg 为无符号整数uint32，输出结果为 65535、2048、8192、32768、43072 等值
+				printf("switch (tcp_msg_op(msg %u ):%u) default ",msg,rs_msg_op(msg));
 				rs->rmsg[rs->rmsg_tail].op = rs_msg_op(msg); 
 				rs->rmsg[rs->rmsg_tail].data = rs_msg_data(msg); //将收到的imm data 存入rmsg
 				if (++rs->rmsg_tail == rs->rq_size + 1)
@@ -2171,7 +2179,7 @@ static int rs_process_cq(struct rsocket *rs, int nonblock, int (*test)(struct rs
 					   // rrecv() => rs_get_comp() => rs_process_cq() 传递来的 rs_conn_have_rdata()，判断 rs_have_rdata(rs) || !(rs->state & rs_readable)，有已接收的数据需要处理，或者rs 不可读时，正常退出
 			ret = 0;// 若 rs 可以执行send 或 rs 状态为不可写，结束循环
 			break;
-		} else if (ret) {// 否则 若rs_poll_cq 返回值不为0，结束循环
+		} else if (ret) {// 否则 若rs_poll_cq 返回值不为0，说明执行ibv_poll_cq 或ibv_post_recv 时出现错误，结束循环，并在循环后将错误信息返回
 			break;
 		} else if (nonblock) {// 否则 若传入的nonblock 为真，
 			ret = ERR(EWOULDBLOCK);// errno==11，ret==-1
@@ -2409,11 +2417,11 @@ static int rs_poll_all(struct rsocket *rs)
  */
 static int rs_can_send(struct rsocket *rs)
 {
-	if (!(rs->opts & RS_OPT_MSG_SEND)) {// rdma write
+	if (!(rs->opts & RS_OPT_MSG_SEND)) {// RoCE rdma write
 		return rs->sqe_avail && (rs->sbuf_bytes_avail >= RS_SNDLOWAT) &&
 		       (rs->sseq_no != rs->sseq_comp) &&
 		       (rs->target_sgl[rs->target_sge].length != 0);// 存在可用sqe ，并且可用send buffer 不小于2048，并且send sequence number 不等于send sequeue completion，并且target_sgl[target_sge] 长度不为0
-	} else {// rdma send
+	} else {// iWarp rdma send
 		return (rs->sqe_avail >= 2) && (rs->sbuf_bytes_avail >= RS_SNDLOWAT) &&
 		       (rs->sseq_no != rs->sseq_comp) &&
 		       (rs->target_sgl[rs->target_sge].length != 0);
@@ -2867,11 +2875,15 @@ ssize_t rsend(int socket, const void *buf, size_t len, int flags)
 		if (ret)
 			goto out;
 	}
-	// rs->state 为connected 后，使用left 管理分片
+	// rs->state 为connected 状态，可以进行数据发送
+	// 使用left 记录待发送的数据长度，left 后续会更新为实际可发送的数据长度
 	for (; left; left -= xfer_size, buf += xfer_size) {// 每循环一次后，left 减小xfer_size，buf 作为要发送数据的指针，向后移动xfer_size 个位置
 		if (!rs_can_send(rs)) {// 若不满足发送条件
 			ret = rs_get_comp(rs, rs_nonblocking(rs, flags),
 					  rs_conn_can_send);// 获取recv cq channel 中的完成事件并进行处理
+					  					// 获取过程中会update credits
+										// rs_conn_can_send 判断是否满足发送条件，若满足则返回0；
+										// 否则返回相关信息（ ibv_get_cq_event \ ibv_post_recv \ ibv_poll_cq 等的错误信息、EAGAIN等）
 			if (ret)
 				break;
 			if (!(rs->state & rs_writable)) {// 若rs 不可写
