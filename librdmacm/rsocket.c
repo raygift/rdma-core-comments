@@ -223,13 +223,19 @@ struct rs_iomap_mr {
 #define RS_CONN_FLAG_IOMAP (1 << 1)
 
 struct rs_conn_data {
-	uint8_t		  version;
-	uint8_t		  flags;
-	__be16		  credits;
-	uint8_t		  reserved[3];
-	uint8_t		  target_iomap_size;
-	struct rs_sge	  target_sgl;
-	struct rs_sge	  data_buf;
+	uint8_t		  version;				// 当前版本为1
+	uint8_t		  flags;				 // RS_CONN_FLAG_NET 如果主机时大端，设为1；为write 确定字节顺序
+	__be16		  credits;				// 初始的receive credits 数量
+	uint8_t		  reserved[3];			// 设为 0
+	uint8_t		  target_iomap_size;	// 
+	struct rs_sge	  target_sgl;		// 将本地接收 credits 信息的receive buffer 信息暴露给对端，以便对端进行update credits 操作；
+										// target SGL 的地址，大小（entries 数量），以及rkey；
+										// 远端将接收到的target_sgl 复制到它们的rs->remote_sgl 中保存（未来使用remote SGL 执行 update credits 操作）
+
+	struct rs_sge	  data_buf;			// 用来告知远端 本地的receive buffer 地址等信息
+										// 初始的receive buffer 地址，大小（字节数），以及rkey
+										// 远端将接收到的 data_buf 复制到它们的第一个target_sgl[0]中（复制到target SGE 是为了将自己的receive buffer地址发送给对方）
+										// 与target_sgl 配合使用
 };
 
 struct rs_conn_private_data {
@@ -337,28 +343,35 @@ struct rsocket {
 			unsigned int	  ctrl_max_seqno;// rsocket 创建时初始化为4
 			uint16_t	  sseq_no;// 发送消息的序号，每执行一次发送（send/write），序号加1
 			uint16_t	  sseq_comp;// send squence completion
-			uint16_t	  rseq_no;
-			uint16_t	  rseq_comp;// recv seqence completion ，赋值为 rq_size 的一半
+			uint16_t	  rseq_no;				// 记录接收端为了接收 rdma_write_with_imm 而事先执行过的 ibv_post_recv() 次数
+			uint16_t	  rseq_comp;			// 当前可接收的rdma write with imm 操作的最大次数，初始时赋值为 rq_size 的一半（用于控制接收方接收速度，当 rseq_comp 小于 rseq_no 时）
 
-			int		  remote_sge;// 接收到对端连接信息时，将对应remote_sge 初始设为1，后续调用rs_send_credits() 时递增+1；当增长到 remote_sql.length 时重置为0，循环使用
-			struct rs_sge	  remote_sgl;
-			struct rs_sge	  remote_iomap;
+// remote 相关属性，记录的是本地提供给远端 rdma write 时需要使用到的信息，本地通过更新 remote 相关属性，控制远端写入时使用的内存
 
-			struct ibv_mr	  *target_mr;// 本机注册target_buffer_list对应target_mr
-			int		  target_sge;// 记录使用的target_sql 中元素的序号，target_sgl 长度为2，因此序号为0或1
+			int		  remote_sge;						// 被远端写内存时，使用的 rbuf 内存分区号；初始为0；当接收到对端的连接后，将对应remote_sge 更新为1；后续接收完数据后，主动调用 rs_send_credits() 将 remote_sge+1 ；当增长到 2 时重置为0，循环使用
+			struct rs_sge	  remote_sgl;				// 记录 连接建立时，对端传输来的 conn->target_sgl 信息，用来进行 credits 更新使用
+			struct rs_sge	  remote_iomap;	// （iomap 相关，暂不涉及）
+
+// target 相关属性，记录的是主动执行 rdma write data（而非update credits 或 发送ctrl）操作时，向远端写入需要用到的信息
+// 当收到远端的update credits 时，需要更新本地可更新 target 相关属性，从而控制写入到远端的内存位置
+// 向远端write data数据（而非更新sge 或发送ctrl 消息）时，发送数据是向 tcp->target_sgl[tcp->target_sge].addr 地址发送
+			struct ibv_mr	  *target_mr;				// 本机写远端内存时，远端注册的 mr
+			int		  target_sge;						// 记录使用的target_sql 中元素的序号，target_sgl 长度为2，因此序号为0或1
 			int		  target_iomap_size;
-			void		  *target_buffer_list;// 本机申请target_buffer_list
-			volatile struct rs_sge	  *target_sgl;// 本机将target_sgl 初始化为target_buffer_list地址；将建立连接时收到的对端remote buffer信息存储在target_sql[0]
+			void		  *target_buffer_list;			// 本机申请target_buffer_list
+			volatile struct rs_sge	  *target_sgl;		// 每个target_sgl 的成员，对应一个远端 receive buffer 的信息；
+														// 本机将target_sgl 初始化为target_buffer_list地址；将建立连接时收到的对端remote buffer信息存储在target_sql[0]
+
 			struct rs_iomap   *target_iomap;
 
-			int		  rbuf_msg_index;// recv buffer msg index，msg 位于recv buffer 的位置
-			int		  rbuf_bytes_avail;// recv bffer 中可用的字节数
-			int		  rbuf_free_offset;//recv buffer 空闲空间的起始偏移量
-			int		  rbuf_offset;// recv buffer 偏移量
+			int		  rbuf_msg_index;	// recv buffer msg index，msg 位于recv buffer 的位置
+			int		  rbuf_bytes_avail;	// recv bffer 中可用的字节数
+			int		  rbuf_free_offset;	//recv buffer 空闲空间的起始偏移量
+			int		  rbuf_offset;		// recv buffer 偏移量
 			struct ibv_mr	  *rmr;
 			uint8_t		  *rbuf;
 
-			int		  sbuf_bytes_avail;// send buffer 中可用的字节数，rs_init_bufs初始时为 sbuf_size；rs_poll_cq() 中获得发送数据消息的完成事件后，sbuf_bytes_avail 增加已完成发送的数据长度；每执行一次发送，需要减去发送的数据长度
+			int		  sbuf_bytes_avail;		// send buffer 中可用的字节数，rs_init_bufs初始时为 sbuf_size；rs_poll_cq() 中获得发送数据消息的完成事件后，sbuf_bytes_avail 增加已完成发送的数据长度；每执行一次发送，需要减去发送的数据长度
 			struct ibv_mr	  *smr;
 			struct ibv_sge	  ssgl[2];// send sgl，包含两个ibv_sge元素，记录了addr,length,lkey；初始时两个元素的addr 均在rs_init_bufs() 中被设为sbuf起始地址；在rs_sbuf_left() 中使用 rs->sbuf[rs->sbuf_size] 地址减去ssgl[0].addr 得到send buf 中未发送的长度
 		};
@@ -391,16 +404,18 @@ struct rsocket {
 	uint16_t	  sq_size;// 
 	uint16_t	  sq_inline;
 
-	uint32_t	  rbuf_size;// 初始设为 1<<17
-  // recv queue size，接收队列大小，初始在rs_alloc被设为384；
-  // 在rs_set_qp_size() 被设为不大于rdma 设备的 max_qp_wr；
-  // 且rbuf_msg_index 不应大于此大小；
-  // msg 为recv queue 中的元素；recv buffer = rq size *RS_MSG_SIZE
-	uint16_t	  rq_size;
-	int		  rmsg_head;//
-	int		  rmsg_tail;// 最后一个接收到的msg 位于rmsg 中的索引；若tail 增长到rq_size+1,则重置为0
+
+	// 接收数据使用到的核心概念为 recv queue
+	// msg 为recv queue 中的元素，单个 msg 大小为32位，使用宏 RS_MSG_SIZE 表示
+	// 在使用rdma send 的iWarp协议中，total_rbuf_size 等于 rq_size + rq size * RS_MSG_SIZE（暂不深究）
+	// 在RoCEv2 中，rbuf_size 初始在 rs_alloc() 被设为 def_mem = (1 << 17)，
+	uint32_t	  rbuf_size;
+	uint16_t	  rq_size;				// recv queue 的大小，初始在 rs_alloc() 中被设为静态常量 def_sqsize 的值 384；在 rs_set_qp_size() 中进行适配，保证不大于rdma 设备的 max_qp_wr，且不小于 宏 RS_QP_MIN_SIZE 16
+										// rq_size 是 rbuf_msg_index 属性的最大值
+	int		  rmsg_head;				// rmsg 队首索引
+	int		  rmsg_tail;				// rmsg 队尾索引；若tail 增长到 rq_size , 则重置为0
 	union {
-		struct rs_msg	  *rmsg;// 指向所有rs_msg 起始地址的指针
+		struct rs_msg	  *rmsg;		// rmsg 队列指针，rmsg 不等于 recv queue 中的 msg；rmsg 同时记录了 32位的 op 和32位的 data；
 		struct ds_rmsg	  *dmsg;
 	};
 
@@ -745,6 +760,15 @@ static void ds_set_qp_size(struct rsocket *rs)
 		rs->sbuf_size = rs->sq_size * RS_SNDLOWAT;
 }
 
+/*
+ * 初始化缓存区
+ * 共需要注册三个内存缓冲区
+ * 1. sbuf：send buffer ，发送数据时首先将数据存入send buffer，执行rdma write/send 时，将sbuf 的地址作为参数传给 ibv_post_send()
+ * 			sbuf 对应的 memroy region 为 smr，只需要local write 权限，只提供给本机进行写入
+ * 2. target_buffer_list
+ * 			target_mr
+ * 3. rbuf：recv buffer，用来接收数据，
+ */
 static int rs_init_bufs(struct rsocket *rs)
 {
 	uint32_t total_rbuf_size, total_sbuf_size;
@@ -798,7 +822,7 @@ static int rs_init_bufs(struct rsocket *rs)
 	rs->rbuf_free_offset = rs->rbuf_size >> 1; // recv buffer free offset 初始化为rbuf_size 的一半
 	rs->rbuf_bytes_avail = rs->rbuf_size >> 1;// rbuf 可用字节数同样初始化为rbuf_size 的一半
 	rs->sqe_avail = rs->sq_size - rs->ctrl_max_seqno;// 可用的send queue element 初始化为 send queue size 减去 rs->ctrl_max_seqno
-	rs->rseq_comp = rs->rq_size >> 1;// recv seqence completion ，赋值为 rq_size 的一半
+	rs->rseq_comp = rs->rq_size >> 1;// recv seqence completion ，初始值为 rq_size 的一半，当rseq_no 的值达到rseq_comp 时，需要更新credits，并增大rseq_comp
 	return 0;
 }
 
@@ -1104,15 +1128,13 @@ static void rs_format_conn_data(struct rsocket *rs, struct rs_conn_data *conn)
 	memset(conn->reserved, 0, sizeof conn->reserved);
 	conn->target_iomap_size = (uint8_t) rs_value_to_scale(rs->target_iomap_size, 8);
 
-	conn->target_sgl.addr = (__force uint64_t)htobe64((uintptr_t) rs->target_sgl);// 目标sgl 地址 即为rs 记录的target_sgl
-	conn->target_sgl.length = (__force uint32_t)htobe32(RS_SGL_SIZE);// 目标sgl 长度为2
-	conn->target_sgl.key = (__force uint32_t)htobe32(rs->target_mr->rkey);// 目标mr
+	conn->target_sgl.addr = (__force uint64_t)htobe64((uintptr_t) rs->target_sgl);		// 目标sgl 地址 即为rs 记录的target_sgl
+	conn->target_sgl.length = (__force uint32_t)htobe32(RS_SGL_SIZE);					// 目标sgl 长度为2
+	conn->target_sgl.key = (__force uint32_t)htobe32(rs->target_mr->rkey);				// 目标mr
 
-	conn->data_buf.addr = (__force uint64_t)htobe64((uintptr_t) rs->rbuf);// 将自己接收数据的buffer 地址传递给对端
-	conn->data_buf.length = (__force uint32_t)htobe32(rs->rbuf_size >> 1);//接收数据的buffer 长度赋值为 recv buffer size 的一半，即对端一次只会写满rbuf 的一半
-	conn->data_buf.key = (__force uint32_t)htobe32(rs->rmr->rkey);// 将自己接收数据的buffer 对应的mr 的remote key 传递给对端
-	// printf("sizeof rs_conn_data %ld\n",sizeof(struct rs_conn_data));
-	// printf("sizeof conn %ld\n",sizeof(conn));
+	conn->data_buf.addr = (__force uint64_t)htobe64((uintptr_t) rs->rbuf);				// 将本地的 receive buffer 地址传递给对端
+	conn->data_buf.length = (__force uint32_t)htobe32(rs->rbuf_size >> 1);				// receive buffer 长度赋值为 recv buffer size 的一半，即对端一次只会写满rbuf 的一半
+	conn->data_buf.key = (__force uint32_t)htobe32(rs->rmr->rkey);						// receive buffer 对应的mr 的remote key，供对端执行 rdma write 操作
 }
 
 static void rs_save_conn_data(struct rsocket *rs, struct rs_conn_data *conn)
@@ -1758,6 +1780,12 @@ static void *rs_get_ctrl_buf(struct rsocket *rs)
 		RS_MAX_CTRL_MSG * (rs->ctrl_seqno & (RS_QP_CTRL_SIZE - 1));
 }
 
+/*
+ * 将 msg 作为 imm_data 通过 rs->cm_id->qp 发送
+ * 当 rs->opts 表明为iWarp 使用的send 时，使用 send opcode 发送
+ * 否则针对RoCE，使用 write_with_imm 发送
+ * 同为RoCE 发送write_with_imm ，与 rs_post_write_msg 的区别是
+ */ 
 static int rs_post_msg(struct rsocket *rs, uint32_t msg)
 {
 	struct ibv_send_wr wr, *bad;
@@ -1765,13 +1793,13 @@ static int rs_post_msg(struct rsocket *rs, uint32_t msg)
 
 	wr.wr_id = rs_send_wr_id(msg);// 将无符号32 位整形msg 扩展为64 位，扩展时高位补0，最高位为0 表示是send wr
 	wr.next = NULL;
-	if (!(rs->opts & RS_OPT_MSG_SEND)) {
+	if (!(rs->opts & RS_OPT_MSG_SEND)) {// RoCE 使用write with imm 发送rsocket message
 		wr.sg_list = NULL;
 		wr.num_sge = 0;
 		wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
 		wr.send_flags = 0;
 		wr.imm_data = htobe32(msg);
-	} else {
+	} else { // iWarp 使用 send 发送 rsocket message
 		sge.addr = (uintptr_t) &msg;
 		sge.lkey = 0;
 		sge.length = sizeof msg;
@@ -1784,6 +1812,10 @@ static int rs_post_msg(struct rsocket *rs, uint32_t msg)
 	return rdma_seterrno(ibv_post_send(rs->cm_id->qp, &wr, &bad));
 }
 
+/*
+ * 使用 rdma write 发送，wr.send_flags 为传入的 flags
+ *
+ */
 static int rs_post_write(struct rsocket *rs,
 			 struct ibv_sge *sgl, int nsge,
 			 uint32_t wr_data, int flags,
@@ -1803,6 +1835,11 @@ static int rs_post_write(struct rsocket *rs,
 	return rdma_seterrno(ibv_post_send(rs->cm_id->qp, &wr, &bad));
 }
 
+/*
+ * 将 msg 作为 imm_data 发送出去
+ * 支持 RoCE 协议时使用 write_with_imm 发送
+ * 支持 iWarp 协议时使用 write + send 两步模拟 write_with_imm 发送
+ */
 static int rs_post_write_msg(struct rsocket *rs,
 			 struct ibv_sge *sgl, int nsge,
 			 uint32_t msg, int flags,
@@ -1813,7 +1850,7 @@ static int rs_post_write_msg(struct rsocket *rs,
 	int ret;
 
 	wr.next = NULL;
-	if (!(rs->opts & RS_OPT_MSG_SEND)) { // rdma write
+	if (!(rs->opts & RS_OPT_MSG_SEND)) { // RoCE rdma write
 		wr.wr_id = rs_send_wr_id(msg); // 
 		wr.sg_list = sgl;
 		wr.num_sge = nsge;// rs_send_credits() 传入的 nsge 为1
@@ -1824,8 +1861,8 @@ static int rs_post_write_msg(struct rsocket *rs,
 		wr.wr.rdma.rkey = rkey;
 
 		return rdma_seterrno(ibv_post_send(rs->cm_id->qp, &wr, &bad));
-	} else {// rdma send
-		ret = rs_post_write(rs, sgl, nsge, msg, flags, addr, rkey);
+	} else {// 由于 iWarp 不支持write with imm，因此分两步模拟write with imm：
+		ret = rs_post_write(rs, sgl, nsge, msg, flags, addr, rkey); // 1，先rdma write 进行 数据写入；
 		if (!ret) {
 			wr.wr_id = rs_send_wr_id(rs_msg_set(rs_msg_op(msg), 0)) |
 				   RS_WR_ID_FLAG_MSG_SEND;
@@ -1837,7 +1874,7 @@ static int rs_post_write_msg(struct rsocket *rs,
 			wr.opcode = IBV_WR_SEND;
 			wr.send_flags = IBV_SEND_INLINE;
 
-			ret = rdma_seterrno(ibv_post_send(rs->cm_id->qp, &wr, &bad));
+			ret = rdma_seterrno(ibv_post_send(rs->cm_id->qp, &wr, &bad));// 2，再执行rdma send inline 发送rsocket 的 msg
 		}
 		return ret;
 	}
@@ -1865,6 +1902,7 @@ static int ds_post_send(struct rsocket *rs, struct ibv_sge *sge,
  * Update target SGE before sending data.  Otherwise the remote side may
  * update the entry before we do.
  * 在发送数据前更新要发送的目标sge，否则远端可能会在发送端更新前对此sge 进行更新
+ * 发送数据是向 tcp->target_sgl[tcp->target_sge].addr 地址发送
  */
 static int rs_write_data(struct rsocket *rs,
 			 struct ibv_sge *sgl, int nsge,
@@ -1873,20 +1911,20 @@ static int rs_write_data(struct rsocket *rs,
 	uint64_t addr;
 	uint32_t rkey;
 
-	rs->sseq_no++;// send msg序号加1
-	rs->sqe_avail--;// 可用sqe 减1 
+	rs->sseq_no++;									// send 序号加1
+	rs->sqe_avail--;								// 可用 sqe 减1 
 	if (rs->opts & RS_OPT_MSG_SEND)
-		rs->sqe_avail--;// rdma send 时，sqe_avail 额外减1
-	rs->sbuf_bytes_avail -= length;//每执行一次发送，需要减去发送的数据长度
+		rs->sqe_avail--;							// iWarp 由于使用 rdma write + rdma send 两次操作来模拟 RoCE 一次 write_with_imm 操作，因此消耗 sqe_avail 额外减1
+	rs->sbuf_bytes_avail -= length;					// send buf 可用字节数减去 要发送的数据长度
 
-	addr = rs->target_sgl[rs->target_sge].addr;// 保存当前target_sgl[] 中sqe元素记录的addr，此addr 为建立连接时save conn data 保存的对端rbuf 地址
-	rkey = rs->target_sgl[rs->target_sge].key;// 保存当前target_sgl[] 中sqe元素记录的对端rmr 的remote key
+	addr = rs->target_sgl[rs->target_sge].addr;		// 保存当前 target_sge 对应的内存地址addr，此 addr 最初为建立连接时 save conn data 保存的对端 rbuf 地址
+	rkey = rs->target_sgl[rs->target_sge].key;		// 保存当前 target_sge 对应的内存的 remote key
 
-	rs->target_sgl[rs->target_sge].addr += length;// 将保存的对端rbuf 地址向后移动length 个位置，下次写入时从mr 的 rbuf+length 处开始写入
-	rs->target_sgl[rs->target_sge].length -= length;// 对端rbuf 由于指针向后移动了length个位置，下次写入时的长度缩小length
+	rs->target_sgl[rs->target_sge].addr += length;	// 更新 target_sge 对应的对端 rbuf 中可写入的内存地址，向后移动length 个位置，下次写入时从最新地址开始写入
+	rs->target_sgl[rs->target_sge].length -= length;// 更新 target_sge 对应的对端 rbuf 中可写入的内存大小，当减小为0 时会更新 target_sge（也即下面的 if 流程）
 
-	if (!rs->target_sgl[rs->target_sge].length) {// 如果更新后sge 对应在target_sgl 元素中记录的长度不为0，则下次仍可正常继续向对端rbuf 写入
-		if (++rs->target_sge == RS_SGL_SIZE)// 若本地target sgl 队列使用完两个元素，将下次使用的sge 序号归零 
+	if (!rs->target_sgl[rs->target_sge].length) {	// 更新 rs->target_sge ，即后续写入将使用接收端 rbuf 的另外一部分进行写入
+		if (++rs->target_sge == RS_SGL_SIZE)		// 若 rs->target_sge 更新后为2，则重置为0
 			rs->target_sge = 0;
 	}
 
@@ -1939,51 +1977,72 @@ static void rs_send_credits(struct rsocket *rs)
 	int flags;
 
 	rs->ctrl_seqno++;// control msg 序号+1
-	rs->rseq_comp = rs->rseq_no + (rs->rq_size >> 1);// recv sequence number 加 recv queue size 的一半，赋值给recv sequence comp
-													// TODO：原因是否为每次传输的数据量只可能是rq_size/2？
-	if (rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) {//若rbuf 中可用字节数大于rbuf_size
+	rs->rseq_comp = rs->rseq_no + (rs->rq_size >> 1);				// 更新credits 之后，后续可处理的write with imm 操作次数与初始时一样仍设为 rq_size/2；rseq_no 是已经处理完成的 with imm 操作，在此基础上增加 rq_size/2，未来rseq_no 继续增加rq_size/2 时，会再次进行update credits 操作
+																	// rseq_no 表示已处理完的rdma write with imm 操作个数
+																	// rseq_comp 表示下次update credits 之前 rseq_no 的上限
+	// 根据rs_give_cretids() 判断 rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)，或 rseq_no >= rseq_comp 时，进行下一次update credits 操作
+
+// 若本次update credits 是由于 rbuf avail 大于了 rbuf_size/2
+	if (rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) {// 若rbuf 中可用字节数大于rbuf_size，则针对RoCE 协议可执行 rdma write with imm 操作
 		if (rs->opts & RS_OPT_MSG_SEND)// 针对iwarp 所用rdma send操作
 			rs->ctrl_seqno++;// control msg 序号+1
+// host B 有新的 receive buffers 可用的情形：
+// 准备 SGE，对应新的可用receive buffers，包含了receive buffers 的addr，可用空间大小，rkey
+// 向host A 的target SGL 发送SGE
+// host A 将根据 target SGL 中被更新的SGE，获取host B 可用receive buffers 的addr，length，rkey
+// host A 后续的发送，将会把数据rdma write 到host B 同步过来的可用receive buffer 中
 
 		if (!(rs->opts & RS_OPT_SWAP_SGL)) {// 若不需要进行网络序和主机序转换
-			sge.addr = (uintptr_t) &rs->rbuf[rs->rbuf_free_offset];// 将rbuf 空闲空间起始地址赋值给sge.addr
-			sge.key = rs->rmr->rkey;// 将recv mr的remote key 赋值给sge.key
-			sge.length = rs->rbuf_size >> 1;// sge 长度为rbuf_size 的一半
+			sge.addr = (uintptr_t) &rs->rbuf[rs->rbuf_free_offset];	// 将rbuf 空闲空间起始地址赋值给sge.addr
+			sge.key = rs->rmr->rkey;								// 将rbuf 对应的 mr的rkey 赋值给sge.key，供对端未来执行rdma write 使用
+			sge.length = rs->rbuf_size >> 1;						// 由于rbuf 可用receive buffer >= rbuf_size 的一半，将sge 长度设为rbuf_size 的一半
+																	// 对端未来针对此receive buffers 的写入数据不能大于此length
 		} else {
 			sge.addr = bswap_64((uintptr_t) &rs->rbuf[rs->rbuf_free_offset]);
 			sge.key = bswap_32(rs->rmr->rkey);
 			sge.length = bswap_32(rs->rbuf_size >> 1);
 		}
 
-		if (rs->sq_inline < sizeof sge) {// 如果send queue inline 数量小于sge 变量大小，表示不使用 IBV_SEND_INLINE 发送？
-			sge_buf = rs_get_ctrl_buf(rs);// 获取control msg buffer 地址
-			memcpy(sge_buf, &sge, sizeof sge);// 将sge 的内容复制到control msg buffer 地址指向的内存中
-			ibsge.addr = (uintptr_t) sge_buf;// 将control msg buffer 地址赋值给 ibsge.addr
-			ibsge.lkey = rs->smr->lkey;// 将send mr 的local key 赋值给ibsge.lkey
+		if (rs->sq_inline < sizeof sge) {							// 如果send queue inline 数量小于sge 变量大小，表示不使用 IBV_SEND_INLINE 发送？
+										 							// 使用 rdma write with imm 发送，就需要将要发送的sge 复制到sbuf 中
+										 							// 然后调用ibv_post_sned()从sbuf 中发送到target->sgl.addr 中
+			sge_buf = rs_get_ctrl_buf(rs);							// 获取下一个control msg 在sbuf 中的地址
+			memcpy(sge_buf, &sge, sizeof sge);						// 将sge 的内容复制到sbuf 中
+			ibsge.addr = (uintptr_t) sge_buf;						// 将control msg 在sbuf 所占的内存地址赋值给 ibsge.addr
+			ibsge.lkey = rs->smr->lkey;								// 将send mr 的local key 赋值给ibsge.lkey，供ibv_post_send() 操作获取到本地读取ctrl msg 并发送的local access 权限
 			flags = 0;
-		} else {
+		} else { // 若使用rdma send 发送inline 数据，不需要从sbuf 中发送，也不需要local key
 			ibsge.addr = (uintptr_t) &sge;
 			ibsge.lkey = 0;
 			flags = IBV_SEND_INLINE;
 		}
-		ibsge.length = sizeof(sge);
+		ibsge.length = sizeof(sge);// 发送的sge 长度
 
+// 发送credits；
+// rs_msg_set 将 RS_OP_SGL 左移29位，4的二进制为100，左移29位后，msg 的高三位即为100，表示 Credit Update 
+// 此时低0～28位的数据表示 received credits granted，即被授权可接收的credits，也就是可用的receive buffer 的信息
+// 此处低0～28位数据为 rq_size 384 + rseq_no，因为在rs_create_ep 时，已经提交了 rq_size 个 ibv_post_recv，而每次poll 到recv 完成事件时，都提交了对应的 ibv_post_recv 并将rseq_no 加1，则当前共提交了 rq_size + rseq_no 次 ibv_post_recv()，也即可用的credits 为两者之和
 		rs_post_write_msg(rs, &ibsge, 1,
 			rs_msg_set(RS_OP_SGL, rs->rseq_no + rs->rq_size), flags,
 			rs->remote_sgl.addr + rs->remote_sge * sizeof(struct rs_sge),
-			rs->remote_sgl.key);// 执行rdma write，发送内容为控制消息的imm data
-								// 参数1 rsocket 实例，参数2 sgl地址，参数3 sge 个数
-								// 参数4 msg 使用rs_msg_set 设置imm data 的高3位，
-								// 参数5 rdma write 操作对端内存的地址，由对端sgl.addr 加上 remote_sge 记录的次数*单个sge 长度
-								// 参数6 对端remote mr key
-//完成一次rdma write之后，进行recv buffer 可用内存地址更新，可用内存偏移量更新，rdma write 使用的sge 个数更新
-		rs->rbuf_bytes_avail -= rs->rbuf_size >> 1;// rbuf 可用字节减少rbuf_size/2，即一次发送会使用rbuf_size/2 大小的buffer 空间
-		rs->rbuf_free_offset += rs->rbuf_size >> 1;// rbuf free offset 增加rbuf_size/2
-		if (rs->rbuf_free_offset >= rs->rbuf_size) // 当判断可用内存偏移量超过rbuf size 时，重置偏移量，循环使用buffer
+			rs->remote_sgl.key);// 执行rdma write
+								// 参数1 rsocket 实例，参数2 将credits 数据封装成 msg 后存放的地址，参数3 更新的sge 个数
+								// 参数4 credits 封装成的msg，高3位为100 表示为 credit update 操作类型；低29位是要更新的 credits 数值
+								// 参数5 rdma write 操作对端内存的地址，由于remote_sgl.addr 记录的是对端接收 credits 消息的内存起始地址，加上 remote_sge * 单个sge 长度表示本次使用的内存实际地址
+								// 参数6 对端接收credits 内存对应的 mr rkey
+
+// 执行 update credits ，表示未来接收到数据时将 消耗rbuf_bytes_avail 中 rbuf_size/2 大小的空间；将此部分空间预留出来
+// 并将可用内存偏移量更新
+// 同时还需要更新对端接收 credits 的sge
+		rs->rbuf_bytes_avail -= rs->rbuf_size >> 1;		// rbuf 可用字节减少 rbuf_size/2
+		rs->rbuf_free_offset += rs->rbuf_size >> 1;		// rbuf 可用地址后移 rbuf_size/2
+		if (rs->rbuf_free_offset >= rs->rbuf_size) 		// 当判断可用内存偏移量超过rbuf size 时，重置偏移量，循环使用 rbuf
 			rs->rbuf_free_offset = 0;
-		if (++rs->remote_sge == rs->remote_sgl.length)// 每次向对端更新完自己接收缓冲rbuf 的状态，切换一个sge，将另一部分内存供对方继续进行写入
-			rs->remote_sge = 0;// 当判断remote sge达到remote sgl 长度时，重置remote sge；目的是轮询使用两个sge
-	} else {// rbuf 中可用字节数小于rbuf_size 的一半，发送
+		if (++rs->remote_sge == rs->remote_sgl.length)// 每执行一次credits update 后，切换一次sge，将另一部分内存供下次update credits 使用
+			rs->remote_sge = 0;// 当判断remote sge达到 2 时，重置remote sge；循环使用两个sge
+	} else {
+		// 否则，本次update credits 是由于 rseq_no >=rseq_comp ，本轮已经至少接收了 rq_size/2 次rdma write with imm，而非rbuf availbytes >= rbuf_size/2
+		// 只需要向对端更新sseq_comp，无须更新sgl[sge].length 及sge
 		rs_post_msg(rs, rs_msg_set(RS_OP_SGL, rs->rseq_no + rs->rq_size));
 	}
 }
@@ -2004,9 +2063,10 @@ static int rs_give_credits(struct rsocket *rs)
 	if (!(rs->opts & RS_OPT_MSG_SEND)) {// roce
 		return ((rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) ||
 			((short) ((short) rs->rseq_no - (short) rs->rseq_comp) >= 0)) &&
-		       rs_ctrl_avail(rs) && (rs->state & rs_connected); // rbuf 可用字节数大于等于 rbuf size 的一半							// 表示recv buf 中可用空间超过了每次传输需要使用的空间，有1个sge 大小的空间可用了
-			   													// 或者recv sequence number 减去 recv sequence comp 的差大于等于0， // 表示
-			   													// 同时ctrl_seqno 不等于ctrl_max_seqno ，同时rs 已经connected
+		       rs_ctrl_avail(rs) && (rs->state & rs_connected); // rbuf 可用字节数大于等于 rbuf size 的一半							 // 表示recv buf 中可用空间超过了每次传输需要使用的空间，有1个sge 大小的空间可用了
+			   													// 或者同时满足一下两个条件
+																// recv sequence number 减去 recv sequence comp 的差大于等于0， 	// rseq_no 表示已经接受完成的rmsg 元素总数，当大于等于 rseq_comp 时，说明
+			   													// ctrl_seqno 不等于ctrl_max_seqno ，同时rs 已经connected
 	} else {// iwarp
 		return ((rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) ||
 			((short) ((short) rs->rseq_no - (short) rs->rseq_comp) >= 0)) &&
@@ -2054,7 +2114,7 @@ static int rs_poll_cq(struct rsocket *rs)
 					[rs_wr_data(wc.wr_id)];// 将无符号64位整型强制转换为无符号32位整型，高位数据被舍弃，低32位数据即为发送端发送的数据
 
 			}
-			switch (rs_msg_op(msg)) {
+			switch (rs_msg_op(msg)) {// 判断 op 类型
 			case RS_OP_SGL:// 若接收到的消息是SGL 控制消息，即为rs_send_credits() 发送来的credits 信息（rs_msg_set(RS_OP_SGL, rs->rseq_no + rs->rq_size)）
 				rs->sseq_comp = (uint16_t) rs_msg_data(msg);// 根据收到的32位无符号整数msg，将值高3位设为0，然后强制转换为16位无符号整型，存入rs send seq completion 中
 				break;
@@ -2077,13 +2137,13 @@ static int rs_poll_cq(struct rsocket *rs)
 			case RS_OP_WRITE:
 				/* We really shouldn't be here. */
 				break;
-			default:
-				// printf tcp_msg_op(msg) 得到 无符号整数 0，表示TCP_OP_DATA；
+			default:// 若不是以上 op 类型的数据
+				// printf tcp_msg_op(msg) 得到结果大多是 无符号整数 0，对应表示TCP_OP_DATA；
 				// printf msg 为无符号整数uint32，输出结果为 65535、2048、8192、32768、43072 等值
 				printf("switch (tcp_msg_op(msg %u ):%u) default ",msg,rs_msg_op(msg));
-				rs->rmsg[rs->rmsg_tail].op = rs_msg_op(msg); 
-				rs->rmsg[rs->rmsg_tail].data = rs_msg_data(msg); //将收到的imm data 存入rmsg
-				if (++rs->rmsg_tail == rs->rq_size + 1)
+				rs->rmsg[rs->rmsg_tail].op = rs_msg_op(msg); 							// 将数据高3位 存储到 rmsg 队尾元素的 op 属性中
+				rs->rmsg[rs->rmsg_tail].data = rs_msg_data(msg); 						// 将数据低29位 存储到 rmsg 队尾元素的 data 属性中
+				if (++rs->rmsg_tail == rs->rq_size + 1)	// rmsg 队尾元素+1，若达到recv queue 大小，则重置为0
 					rs->rmsg_tail = 0;
 				break;
 			}
