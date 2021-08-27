@@ -339,8 +339,8 @@ struct rsocket {
 			unsigned int	  keepalive_time;
 			int		  accept_queue[2];// 记录server 已完成rdma_accept() 的agent
 
-			unsigned int	  ctrl_seqno; // 记录当前ctrl 消息的序号
-			unsigned int	  ctrl_max_seqno;// rsocket 创建时初始化为4
+			unsigned int	  ctrl_seqno; 				// 记录发送过的ctrl 消息数量，包括update credits 和其他ctrl 消息；每执行一次 ctrl 发送，加1（iWarp 额外再加1）
+			unsigned int	  ctrl_max_seqno;			// rsocket 创建时初始化为4，控制可发送的ctrl 消息数量，每获得一次ctrl 消息发送wc ，max_seqno 加1
 			uint16_t	  sseq_no;// 发送消息的序号，每执行一次发送（send/write），序号加1
 			uint16_t	  sseq_comp;// send squence completion
 			uint16_t	  rseq_no;				// 记录接收端为了接收 rdma_write_with_imm 而事先执行过的 ibv_post_recv() 次数
@@ -1984,9 +1984,10 @@ static void rs_send_credits(struct rsocket *rs)
 
 // 若本次update credits 是由于 rbuf avail 大于了 rbuf_size/2
 	if (rs->rbuf_bytes_avail >= (rs->rbuf_size >> 1)) {// 若rbuf 中可用字节数大于rbuf_size，则针对RoCE 协议可执行 rdma write with imm 操作
-		if (rs->opts & RS_OPT_MSG_SEND)// 针对iwarp 所用rdma send操作
-			rs->ctrl_seqno++;// control msg 序号+1
-// host B 有新的 receive buffers 可用的情形：
+		if (rs->opts & RS_OPT_MSG_SEND)								// 针对iwarp 所用rdma send操作，由于发送credits 使用 rdma wrie + rdma send 两次操作，因此ctrl_seqno 额外加1
+			rs->ctrl_seqno++;
+// 参考 https://github.com/linux-rdma/rdma-core/blob/master/librdmacm/docs/rsocket
+// 对应上述文档中 host B 有新的 receive buffers 可用的情形：
 // 准备 SGE，对应新的可用receive buffers，包含了receive buffers 的addr，可用空间大小，rkey
 // 向host A 的target SGL 发送SGE
 // host A 将根据 target SGL 中被更新的SGE，获取host B 可用receive buffers 的addr，length，rkey
@@ -2047,6 +2048,13 @@ static void rs_send_credits(struct rsocket *rs)
 	}
 }
 
+/*
+ * 根据ctrl_seqno 和 ctrl_max_seqno 比较结果，判断是否可以发送 ctrl 消息
+ * ctrl_max_seqno 在每次获得 发送ctrl 消息的 wc 后，加1
+ * ctrl_seqno 在每次执行 update credits 发送时加1
+ * 在每次执行update credits 之前，需判断 ctrl_avail，保证ctrl_seqno < ctrl_max_seqno
+ *
+ */
 static inline int rs_ctrl_avail(struct rsocket *rs)
 {
 	return rs->ctrl_seqno != rs->ctrl_max_seqno;
@@ -2149,11 +2157,11 @@ static int rs_poll_cq(struct rsocket *rs)
 			}
 		} else {// 获取到的wc 是发送操作的完成事件
 			switch  (rs_msg_op(rs_wr_data(wc.wr_id))) {
-			case RS_OP_SGL: // 完成credits 发送
-				rs->ctrl_max_seqno++; // 控制信息最大序号加1
+			case RS_OP_SGL: 												// 完成update credits 发送
+				rs->ctrl_max_seqno++; 										// 控制信息最大序号加1
 				break;
 			case RS_OP_CTRL:
-				rs->ctrl_max_seqno++; // 控制信息最大序号加1
+				rs->ctrl_max_seqno++; 										// 控制信息最大序号加1
 				if (rs_msg_data(rs_wr_data(wc.wr_id)) == RS_CTRL_DISCONNECT)// 若发送的控制信息为断开连接
 					rs->state = rs_disconnected;// 修改连接状态
 				break;
@@ -2187,7 +2195,7 @@ static int rs_poll_cq(struct rsocket *rs)
 }
 
 /*
- * 判断rs->cq_armed，若为0 则返回0
+ * 判断rs->cq_armed，若为0 表示已经从cq 中获取到过cqe，直接返回0
  * 否则执行ibv_get_cq_event()，从cm_id的recv cq channel 中获得cqe，并将rs->cq_armed 重置为0
  * 
  */
@@ -2202,9 +2210,9 @@ static int rs_get_cq_event(struct rsocket *rs)
 
 	ret = ibv_get_cq_event(rs->cm_id->recv_cq_channel, &cq, &context);
 	if (!ret) {// 执行成功，表示cq channel 中存在cqe 事件
-		if (++rs->unack_cqe >= rs->sq_size + rs->rq_size) {// 若unack_cqe 大于等于 send queue 和 recv queue 队列长度之和
-			ibv_ack_cq_events(rs->cm_id->recv_cq, rs->unack_cqe);// 执行ack 确认所有unack event
-			rs->unack_cqe = 0;// unack 清零
+		if (++rs->unack_cqe >= rs->sq_size + rs->rq_size) {				// 若unack_cqe 大于等于 send queue 和 recv queue 队列长度之和
+			ibv_ack_cq_events(rs->cm_id->recv_cq, rs->unack_cqe);		// 执行ack 确认所有unack event
+			rs->unack_cqe = 0;// unack_cqe 清零
 		}
 		rs->cq_armed = 0;
 	} else if (!(errno == EAGAIN || errno == EINTR)) {
@@ -2234,25 +2242,28 @@ static int rs_process_cq(struct rsocket *rs, int nonblock, int (*test)(struct rs
 
 	fastlock_acquire(&rs->cq_lock);// 首先获取 cq_lock ，从而可以获取到cq 中的完成事件
 	do {
-		rs_update_credits(rs);// 发送credits
-		ret = rs_poll_cq(rs); // 循环从cq 中获取cqe，直到获取不到新的cqe；对获取到的cqe 按照不同wr 进行处理；针对recv wc再次提交新的recv wr；
-		if (test(rs)) {// test()函数为 rssend() => rs_get_comp() => rs_process_cq() 传递来的rs_conn_can_send()，判断 rs_can_send(rs) || !(rs->state & rs_writable) ，有数据可发送，或者rs 不可写时，正常退出
-					   // rrecv() => rs_get_comp() => rs_process_cq() 传递来的 rs_conn_have_rdata()，判断 rs_have_rdata(rs) || !(rs->state & rs_readable)，有已接收的数据需要处理，或者rs 不可读时，正常退出
-			ret = 0;// 若 rs 可以执行send 或 rs 状态为不可写，结束循环
+		rs_update_credits(rs);							// 尝试向对端更新credits
+		ret = rs_poll_cq(rs); 							// 循环从cq 中获取cqe，直到获取不到新的cqe；对获取到的cqe 按照不同wr 进行处理；针对recv wc再次提交新的recv wr；
+		if (test(rs)) {									// test()函数为 rssend() => rs_get_comp() => rs_process_cq() 传递来的rs_conn_can_send()，判断 rs_can_send(rs) || !(rs->state & rs_writable) ，有数据可发送，或者rs 不可写时，正常退出
+					   									// rrecv() => rs_get_comp() => rs_process_cq() 传递来的 rs_conn_have_rdata()，判断 rs_have_rdata(rs) || !(rs->state & rs_readable)，有已接收的数据需要处理，或者rs 不可读时，正常退出
+			ret = 0;								// 若 rs 可以执行send 或 rs 状态为不可写，结束循环
 			break;
-		} else if (ret) {// 否则 若rs_poll_cq 返回值不为0，说明执行ibv_poll_cq 或ibv_post_recv 时出现错误，结束循环，并在循环后将错误信息返回
-			break;
-		} else if (nonblock) {// 否则 若传入的nonblock 为真，
-			ret = ERR(EWOULDBLOCK);// errno==11，ret==-1
-		} else if (!rs->cq_armed) {
-			ibv_req_notify_cq(rs->cm_id->recv_cq, 0);
+		} else if (ret) {							// 否则 若rs_poll_cq 返回值不为0，说明执行ibv_poll_cq 或ibv_post_recv 时出现错误或被下一个else if 设置了ret=-1，
+			break;										// 结束循环，并在循环后将错误信息返回
+		} else if (nonblock) {						// 否则 若传入的nonblock 为真，
+			ret = ERR(EWOULDBLOCK);						// 设置errno==11及ret==-1，在下次循环时可能被前一个 else if 判断ret!=0 而退出循环；
+		} 
+
+// 下方逻辑对应 rs_get_comp() 中在超过polling_time 时，执行最后一次 阻塞的 rs_process_cq()
+		else if (!rs->cq_armed) {					// 否则 test(rs)为否，nonblock 为否，ret == 0，且rs->cq_armed ==0 表示已经从cq 中获取到过cqe
+			ibv_req_notify_cq(rs->cm_id->recv_cq, 0);	// 再次请求recv_cq 中完成事件的通知
 			rs->cq_armed = 1;
-		} else {// 否则 在rs 阻塞的情况下
-			rs_update_credits(rs);// 向对端更新credits
+		} else {									// 否则 说明没有从cq 中获取到过cqe
+			rs_update_credits(rs);						// 再次尝试向对端更新credits
 			fastlock_acquire(&rs->cq_wait_lock);// 获取cq_wait_lock，从而可以使用阻塞的方式从cq 中获得完成事件
 			fastlock_release(&rs->cq_lock);// 释放cq_lock，从而其他操作可以从cq 中获取完成事件
 
-			ret = rs_get_cq_event(rs);// rs是阻塞的，此处阻塞直到从rs->cm_id->recv_cq_channel 中获得cqe，并发送ack
+			ret = rs_get_cq_event(rs);			// 从rs->cm_id->recv_cq_channel 中获得cqe，并发送ack
 			fastlock_release(&rs->cq_wait_lock);// 释放cq_wait_lock，不再使用阻塞的方式等待从cq 获得完成事件
 			fastlock_acquire(&rs->cq_lock);// 重新申请cq_lock ，方便循环外统一进行release 操作
 		}
@@ -3383,6 +3394,9 @@ check_cq:
 	return 0;
 }
 
+/*
+ * 
+ */
 static int rs_poll_check(struct pollfd *fds, nfds_t nfds)
 {
 	struct rsocket *rs;
@@ -3462,6 +3476,9 @@ static int rs_poll_events(struct pollfd *rfds, struct pollfd *fds, nfds_t nfds)
  * Note that we may receive events on an rsocket that may not be reported
  * to the user (e.g. connection events or credit updates).  Process those
  * events, then return to polling until we find ones of interest.
+ * 需要将所有用户指定的 fd 至少poll 一次
+ * 需要注意，可能会在rsocket 接收到不会报告给用户的事件（例如 连接事件或更新credits 事件）
+ * 处理那些事件，并在获取到下一个感兴趣的事件之前持续polling
  */
 int rpoll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
