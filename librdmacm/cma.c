@@ -2861,7 +2861,7 @@ int ucma_max_qpsize(struct rdma_cm_id *id)
 	id_priv = container_of(id, struct cma_id_private, id);// container_of通过一个结构变量中一个成员的地址找到这个结构体变量的首地址
 	if (id && id_priv->cma_dev) {
 		max_size = id_priv->cma_dev->max_qpsize;// 获取 rdma 设备的 max qp size
-		printf("id_priv->cma_dev->max_qpsize %d\n",id_priv->cma_dev->max_qpsize);
+		// printf("id_priv->cma_dev->max_qpsize %d\n",id_priv->cma_dev->max_qpsize);
 	} else {
 		ucma_init_all();
 		pthread_mutex_lock(&mut);

@@ -91,6 +91,10 @@ struct rs_svc_msg {
 	struct rsocket *rs;
 };
 
+/* rsocket service 结构体
+ * 存在 tcp_svc ，udp_svc，listen_svc，connect_svc 几种
+ * 结构体中记录有需要执行svc 的rsocket 实例，svc 的线程号，上下文等
+ */
 struct rs_svc {
 	pthread_t id;
 	int sock[2];
@@ -337,7 +341,7 @@ struct rsocket {
 			struct rdma_cm_id *cm_id;
 			uint64_t	  tcp_opts;
 			unsigned int	  keepalive_time;
-			int		  accept_queue[2];// 记录server 已完成rdma_accept() 的agent
+			int		  accept_queue[2];// socketpair() 创建的socket 对，都可以用于读写；写socket 0 后，再读取socket 0会被阻塞，只能从socket 1 成功读取；读、写操作可位于同一进程，也可位于不同进程
 
 			unsigned int	  ctrl_seqno; 				// 记录发送过的ctrl 消息数量，包括update credits 和其他ctrl 消息；每执行一次 ctrl 发送，加1（iWarp 额外再加1）
 			unsigned int	  ctrl_max_seqno;			// rsocket 创建时初始化为4，控制可发送的ctrl 消息数量，每获得一次ctrl 消息发送wc ，max_seqno 加1
@@ -494,12 +498,12 @@ static int rs_notify_svc(struct rs_svc *svc, struct rsocket *rs, int cmd)
 	int ret;
 
 	pthread_mutex_lock(&svc_mut);
-	if (!svc->cnt) {
-		ret = socketpair(AF_UNIX, SOCK_STREAM, 0, svc->sock);
+	if (!svc->cnt) {// svc->cnt == 0 表示尚没有rsocket 实例需要执行svc，也就没有 rsocket 被加入到svc->rss 队列中；需要为 svc 创建线程等
+		ret = socketpair(AF_UNIX, SOCK_STREAM, 0, svc->sock);// 创建socketpair，并创建一个新线程
 		if (ret)
 			goto unlock;
 
-		ret = pthread_create(&svc->id, NULL, svc->run, svc);
+		ret = pthread_create(&svc->id, NULL, svc->run, svc);// 创建新线程，从 svc->run 开始执行
 		if (ret) {
 			ret = ERR(ret);
 			goto closepair;
@@ -509,13 +513,13 @@ static int rs_notify_svc(struct rs_svc *svc, struct rsocket *rs, int cmd)
 	msg.cmd = cmd;
 	msg.status = EINVAL;
 	msg.rs = rs;
-	write_all(svc->sock[0], &msg, sizeof(msg));
-	read_all(svc->sock[0], &msg, sizeof(msg));
-	ret = rdma_seterrno(msg.status);
-	if (svc->cnt)
-		goto unlock;
+	write_all(svc->sock[0], &msg, sizeof(msg));// 将msg 写入到socket[0]中
+	read_all(svc->sock[0], &msg, sizeof(msg));// 从socket[0]中读取数据，存入msg 中
+	ret = rdma_seterrno(msg.status);// 设置errno
+	if (svc->cnt)// svc->cnt 不为0，表示rsocket service 中已经有rsocket 实例被加入
+		goto unlock;// 跳过等待其他线程，跳过关闭socketpair
 
-	pthread_join(svc->id, NULL);
+	pthread_join(svc->id, NULL);// 访问创建好的新线程，在该线程退出之前阻塞等待
 closepair:
 	close(svc->sock[0]);
 	close(svc->sock[1]);
@@ -699,7 +703,7 @@ static int rs_set_nonblocking(struct rsocket *rs, int arg)
 			ret = fcntl(rs->cm_id->recv_cq_channel->fd, F_SETFL, arg);
 
 		if (rs->state == rs_listening)
-			ret = fcntl(rs->accept_queue[0], F_SETFL, arg);
+			ret = fcntl(rs->accept_queue[0], F_SETFL, arg);// 将socketpair() 创建的 socket 0 设为非阻塞
 		else if (!ret && rs->state < rs_connected)
 			ret = fcntl(rs->cm_id->channel->fd, F_SETFL, arg);
 	} else {
@@ -1289,12 +1293,12 @@ int rlisten(int socket, int backlog)
 	if (ret)
 		return ret;
 
-	ret = socketpair(AF_UNIX, SOCK_STREAM, 0, rs->accept_queue);
+	ret = socketpair(AF_UNIX, SOCK_STREAM, 0, rs->accept_queue);// socketpair()函数用于创建一对无名的、相互连接的socket；用户使用socket()系统调用编写应用程序时，通过一个数字来表示一个socket，所有的操作都在该数字上进行，这个数字称为套接字描述符。在系统调用 的实现函数里，这个数字就会被映射成一个表示socket的结构体，该结构体保存了该socket的所有属性和数据。
 	if (ret)
 		return ret;
 
 	if (rs->fd_flags & O_NONBLOCK) {
-		ret = set_fd_nonblock(rs->accept_queue[0], true);
+		ret = set_fd_nonblock(rs->accept_queue[0], true);// 将socket 对的第一个socket 设为非阻塞
 		if (ret)
 			return ret;
 	}
@@ -1362,7 +1366,7 @@ static void rs_accept(struct rsocket *rs)
 	else
 		goto err;
 
-	write_all(rs->accept_queue[1], &new_rs, sizeof(new_rs));
+	write_all(rs->accept_queue[1], &new_rs, sizeof(new_rs));// 向创建的socket 1 写入数据
 	return;
 
 err:
@@ -1383,7 +1387,7 @@ int raccept(int socket, struct sockaddr *addr, socklen_t *addrlen)
 	if (rs->state != rs_listening)
 		return ERR(EBADF);
 
-	ret = read(rs->accept_queue[0], &new_rs, sizeof(new_rs));
+	ret = read(rs->accept_queue[0], &new_rs, sizeof(new_rs));// 从创建的socket 0 中读取数据
 	if (ret != sizeof(new_rs))
 		return ret;
 
@@ -2148,7 +2152,7 @@ static int rs_poll_cq(struct rsocket *rs)
 			default:// 若不是以上 op 类型的数据
 				// printf tcp_msg_op(msg) 得到结果大多是 无符号整数 0，对应表示TCP_OP_DATA；
 				// printf msg 为无符号整数uint32，输出结果为 65535、2048、8192、32768、43072 等值
-				printf("switch (tcp_msg_op(msg %u ):%u) default ",msg,rs_msg_op(msg));
+				// printf("switch (tcp_msg_op(msg %u ):%u) default ",msg,rs_msg_op(msg));
 				rs->rmsg[rs->rmsg_tail].op = rs_msg_op(msg); 							// 将数据高3位 存储到 rmsg 队尾元素的 op 属性中
 				rs->rmsg[rs->rmsg_tail].data = rs_msg_data(msg); 						// 将数据低29位 存储到 rmsg 队尾元素的 data 属性中
 				if (++rs->rmsg_tail == rs->rq_size + 1)	// rmsg 队尾元素+1，若达到recv queue 大小，则重置为0
@@ -2197,6 +2201,7 @@ static int rs_poll_cq(struct rsocket *rs)
 /*
  * 判断rs->cq_armed，若为0 表示已经从cq 中获取到过cqe，直接返回0
  * 否则执行ibv_get_cq_event()，从cm_id的recv cq channel 中获得cqe，并将rs->cq_armed 重置为0
+ * 返回 ibv_get_cq_event() 执行结果
  * 
  */
 static int rs_get_cq_event(struct rsocket *rs)
@@ -2235,6 +2240,15 @@ static int rs_get_cq_event(struct rsocket *rs)
  * We handle this by using two locks.  The cq_lock protects against polling
  * the CQ and processing completions.  The cq_wait_lock serializes access to
  * waiting on the CQ.
+ * 
+ * 尽管rsend 和 rrecv 的调用单独看都是串行化的，但两类调用还是会同时执行并需要从CQ 中获取完成事件
+ * 我们需要将对CQ 的访问串行，同时 rsend 和rrecv 需要允许对方正常继续执行。
+ * 
+ * 例如，rsend 可能需要等待远端更新credits，而远端可能会在调用rrecv 之后才会更新credits。
+ * 但rsend 的等待，不能阻塞执行rrecv 从而接收远端的数据
+ * 
+ * 我们通过使用两把锁来处理此情况。 cq_lock 用来保护从CQ 中获取事件并进行处理。
+ * cq_wait_lock 用来将对CQ 的访问等待进行串行化。
  */
 static int rs_process_cq(struct rsocket *rs, int nonblock, int (*test)(struct rsocket *rs))
 {
@@ -2267,7 +2281,7 @@ static int rs_process_cq(struct rsocket *rs, int nonblock, int (*test)(struct rs
 			fastlock_release(&rs->cq_wait_lock);// 释放cq_wait_lock，不再使用阻塞的方式等待从cq 获得完成事件
 			fastlock_acquire(&rs->cq_lock);// 重新申请cq_lock ，方便循环外统一进行release 操作
 		}
-	} while (!ret);// ret 为0时，持续循环
+	} while (!ret);// ret 为0时，表示没有从cq 中poll 到事件时，持续循环
 
 	rs_update_credits(rs);// 向对端更新rbuf 状态
 	fastlock_release(&rs->cq_lock);
@@ -2472,6 +2486,7 @@ static int rs_is_cq_armed(struct rsocket *rs)
 	return rs->cq_armed;
 }
 
+// 始终返回true
 static int rs_poll_all(struct rsocket *rs)
 {
 	return 1;
@@ -3191,7 +3206,9 @@ static int rs_pollinit(void)
 	if (pollsignal >= 0)
 		goto unlock;
 
-	pollsignal = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
+	pollsignal = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);// 创建一个eventfd对象
+	// eventfd通过一个进程间共享的64位计数器完成进程间通信，这个计数器由在linux内核空间维护
+	// 用户可以通过调用write方法向内核空间写入一个64位的值，也可以调用read方法读取这个值。
 	if (pollsignal < 0)
 		ret = -errno;
 
@@ -3200,20 +3217,23 @@ unlock:
 	return ret;
 }
 
-/* When an event occurs, we must wait until the state of all rsockets
+/* 进入rs poll ，直到 suspendpoll 为true时，将当前线程yield 并返回 -EBUSY
+ * When an event occurs, we must wait until the state of all rsockets
  * has settled.  Then we need to re-check the rsocket state prior to
  * blocking on poll().
+ * 
+ * 当发生一个事件时，必须等待直到所有rsocket 的状态都稳定。然后在poll() 中阻塞之前，需要重新检查rsocket 的状态
  */
 static int rs_poll_enter(void)
 {
 	pthread_mutex_lock(&mut);
-	if (suspendpoll) {
+	if (suspendpoll) {// 挂起poll
 		pthread_mutex_unlock(&mut);
-		sched_yield();
+		sched_yield();// 会导致当前线程放弃CPU，进程管理系统会把该线程放到其对应优先级的CPU静态进程队列的尾端，然后一个新的线程会占用CPU。
 		return -EBUSY;
 	}
-
-	pollcnt++;
+// suspendpoll 尚未更新为 1
+	pollcnt++;// 全局变量计数+1
 	pthread_mutex_unlock(&mut);
 	return 0;
 }
@@ -3225,18 +3245,23 @@ static void rs_poll_exit(void)
 	ssize_t ret;
 
 	pthread_mutex_lock(&mut);
-	if (!--pollcnt) {
+	if (!--pollcnt) {// pollcnt 当前为1
 		/* Keep errno value from poll() call.  We try to clear
 		 * a single signal.  But there's no guarantee that we'll
 		 * find one.  Additional signals indicate that a change
 		 * occurred on an rsocket, which requires all threads to
 		 * re-check before blocking on poll.
+		 * 
+		 * 保存调用poll() 之后的errno 值。
+		 * 我们尝试清理一个 single signal，但没办法保证一定可以找得到
+		 * 附加的 signal 指示了一个rsocket 上发生的变化，需要所有线程调用poll() 并阻塞之前再次进行check
+		 * 
 		 */
 		save_errno = errno;
-		ret = read(pollsignal, &c, sizeof(c));
+		ret = read(pollsignal, &c, sizeof(c));// 读取pollsignal，再次唤醒所有rsocket 检查是否有对应事件； eventfd_read()设置了EFD_SEMAPHORE后，每次读取到的值都是1，且read后计数器也递减1。
 		if (ret != sizeof(c))
 			errno = save_errno;
-		suspendpoll = 0;
+		suspendpoll = 0;// 将suspendpoll 重置为 0
 	}
 	pthread_mutex_unlock(&mut);
 }
@@ -3304,9 +3329,16 @@ static int rs_poll_signal(void)
 
 /* We always add the pollsignal read fd to the poll fd set, so
  * that we can signal any blocked threads.
+ *
+ * poll() 单个 process 就可以同时处理多个网络连接的IO
+ * 为了让rpoll 实现类似于poll()的功能
+ * 使用rfds 作为多个被I/O 阻塞的fd 所对应的pollfd 数组的指针
+ * 同时为了可以在合适的时候主动唤醒被阻塞的线程，将pollsignal fd 加入到rfds 中
+ * 当需要唤醒被阻塞的线程时，主动对pollsignal 进行read 或write 操作
  */
 static struct pollfd *rs_fds_alloc(nfds_t nfds)
-{
+{// __thread 变量每一个线程有一份独立实体，各个线程的值互不干扰。可以用来修饰那些带有全局性且值可能变，但是又不值得用全局变量保护的变量
+ // 线程内的全局变量
 	static __thread struct pollfd *rfds;
 	static __thread nfds_t rnfds;
 
@@ -3316,43 +3348,51 @@ static struct pollfd *rs_fds_alloc(nfds_t nfds)
 		else if (rs_pollinit())
 			return NULL;
 
-		rfds = malloc(sizeof(*rfds) * nfds + 1);
-		rnfds = rfds ? nfds + 1 : 0;
+		rfds = malloc(sizeof(*rfds) * nfds + 1);// 动态分配 rfds 内存空间
+		rnfds = rfds ? nfds + 1 : 0;// rfds 内存分配成功，rnfds 值设为nfds+1，+1 是因为要给pollsignal 预留
 	}
 
-	if (rfds) {
-		rfds[nfds].fd = pollsignal;
-		rfds[nfds].events = POLLIN;
+	if (rfds) {// rfds 已获得分配的内存空间
+		rfds[nfds].fd = pollsignal; // 将rfds 最后一个元素的fd 设为 pollsignal
+		rfds[nfds].events = POLLIN; // 将 pollsignal 关注的事件设为POLLIN
 	}
 	return rfds;
 }
 
+/* 尝试从rsocket 上poll 一些事件
+ * 若成功poll 到事件，返回事件掩码
+ * 若没有poll 到事件，返回0
+ * 当连接为TCP 且已经连接或完成连接时，通过poll cq 并判断have_rdata 和 can_send 来手动设置 pollin 或 pollout
+ * 当连接为TCP 但仍处理listening 时，对 accept_queue 存储的双工socket 对之一socket 0进行一次 poll() ，返回poll 结果
+ * 参数 events 表示关注的事件类型
+ */
 static int rs_poll_rs(struct rsocket *rs, int events,
 		      int nonblock, int (*test)(struct rsocket *rs))
 {
 	struct pollfd fds;
-	short revents;
+	short revents; // 进行poll 的fd 上实际获取到的事件类型
 	int ret;
 
 check_cq:
 	if ((rs->type == SOCK_STREAM) && ((rs->state & rs_connected) ||
-	     (rs->state == rs_disconnected) || (rs->state & rs_error))) {
-		rs_process_cq(rs, nonblock, test);
+	     (rs->state == rs_disconnected) || (rs->state & rs_error))) {// 如果为 tcp 连接，并且 rs-> satte 状态为条件中三者之一
+		rs_process_cq(rs, nonblock, test);// 由rs_poll_check() 或 rs_poll_event() 调用时， 尝试向对端更新credits，然后从CQ 中获取 1 次所有完成事件，再次尝试更新credits
+										  // 由 rs_poll_arm() 调用时，更新credits，poll 所有cq，设置armed =1 ，再次更新credits，再次poll cq，返回0
 
 		revents = 0;
-		if ((events & POLLIN) && rs_conn_have_rdata(rs))
-			revents |= POLLIN;
-		if ((events & POLLOUT) && rs_can_send(rs))
-			revents |= POLLOUT;
-		if (!(rs->state & rs_connected)) {
+		if ((events & POLLIN) && rs_conn_have_rdata(rs))// 判断传入的events 代表的事件类型，若为pollin 类型表示有数据可读，若同时确定存在数据可读
+			revents |= POLLIN;	// revents 与 pollin 进行“或”操作，记录下pollin 类型
+		if ((events & POLLOUT) && rs_can_send(rs))// 若判断传入的events 代表的事件类型为pollout，表示数据可写，若同时判断满足发送条件
+			revents |= POLLOUT;	// revents 记录pollout 状态
+		if (!(rs->state & rs_connected)) { // 若连接状态不是connected，使用revents 记录响应poll 类型
 			if (rs->state == rs_disconnected)
-				revents |= POLLHUP;
+				revents |= POLLHUP;// POLLHUP：对方描述符挂起
 			else
-				revents |= POLLERR;
+				revents |= POLLERR;// 发生错误
 		}
 
 		return revents;
-	} else if (rs->type == SOCK_DGRAM) {
+	} else if (rs->type == SOCK_DGRAM) {// udp 相关处理
 		ds_process_cqs(rs, nonblock, test);
 
 		revents = 0;
@@ -3364,15 +3404,15 @@ check_cq:
 		return revents;
 	}
 
-	if (rs->state == rs_listening) {
-		fds.fd = rs->accept_queue[0];
-		fds.events = events;
+	if (rs->state == rs_listening) { // tcp，但状态不是connected，disconnected或者 error，而是正在监听
+		fds.fd = rs->accept_queue[0];// 将创建的socket 0 赋值给 fds.fd，接下来会对其进行poll 获取事件
+		fds.events = events;// 将调用rs_poll_rs() 时传入的events 作为关注的事件类型赋值给fds.events
 		fds.revents = 0;
-		poll(&fds, 1, 0);
-		return fds.revents;
+		poll(&fds, 1, 0);// 获取 socket 0 上的事件
+		return fds.revents;// 返回fds.fd 上获取到的事件类型
 	}
 
-	if (rs->state & rs_opening) {
+	if (rs->state & rs_opening) {// tcp通信，但状态尚处在opening
 		ret = rs_do_connect(rs);
 		if (ret && (errno == EINPROGRESS)) {
 			errno = 0;
@@ -3394,8 +3434,9 @@ check_cq:
 	return 0;
 }
 
-/*
- * 
+/* rpoll 中首先执行一次poll check，尝试获取所有rs 上的事件
+ * 若能获取到则返回存在事件的fd 个数
+ * 否则返回0
  */
 static int rs_poll_check(struct pollfd *fds, nfds_t nfds)
 {
@@ -3403,48 +3444,61 @@ static int rs_poll_check(struct pollfd *fds, nfds_t nfds)
 	int i, cnt = 0;
 
 	for (i = 0; i < nfds; i++) {
-		rs = idm_lookup(&idm, fds[i].fd);
+		rs = idm_lookup(&idm, fds[i].fd);// 获取 fds 中所有元素fd 对应的rsocket 实例
 		if (rs)
-			fds[i].revents = rs_poll_rs(rs, fds[i].events, 1, rs_poll_all);
+			fds[i].revents = rs_poll_rs(rs, fds[i].events, 1, rs_poll_all);// 当存在fd 对应的 rsocket 时，使用rs_poll_rs 尝试获取事件
 		else
-			poll(&fds[i], 1, 0);
+			poll(&fds[i], 1, 0);// 当fd 不存在对应rsocket 实例时，直接调用poll() 从fd 上获取事件
 
-		if (fds[i].revents)
+		if (fds[i].revents)// 如果能够获取到事件，则事件类型记录在 revents 
 			cnt++;
 	}
 	return cnt;
 }
 
+/*
+ * 根据 rs 及rs->state 将需要继续关注的fd 加入 rfds，并将关注的事件类型设为POLLIN
+ * 正常执行返回0；
+ * 若获取到fds 中fd 上的事件，返回1
+ */
 static int rs_poll_arm(struct pollfd *rfds, struct pollfd *fds, nfds_t nfds)
 {
 	struct rsocket *rs;
 	int i;
-
+int s=0;
 	for (i = 0; i < nfds; i++) {
 		rs = idm_lookup(&idm, fds[i].fd);
 		if (rs) {
-			fds[i].revents = rs_poll_rs(rs, fds[i].events, 0, rs_is_cq_armed);
-			if (fds[i].revents)
-				return 1;
+			fds[i].revents = rs_poll_rs(rs, fds[i].events, 0, rs_is_cq_armed);// 判断当前是否能够从fds 的所有fd 上获取到事件
+			if (fds[i].revents)// 若获取到某个fd 上的事件(其他fd 不被rearm 如何保证其他fd 不会饥饿)
+				return 1;	   // 无须arm 直接返回
+			// {
+			// 	s++;
+			// 	continue;
+			// }	
 
-			if (rs->type == SOCK_STREAM) {
-				if (rs->state >= rs_connected)
-					rfds[i].fd = rs->cm_id->recv_cq_channel->fd;
+// 未从当前fd 中获取到事件，根据rs 状态判断将哪个fd 放入rfds 中进行事件监听
+			if (rs->type == SOCK_STREAM) { // 当连接为tcp 时
+				if (rs->state >= rs_connected)// 当rs 连接状态为已连接，或者其他连接完成后的状态时
+					rfds[i].fd = rs->cm_id->recv_cq_channel->fd;// 此时需要监听recv cq channel 上的事件，将 recv_cq_channel-> fd 作为需要监听事件的fd，加入到 rfds 中，监听cq 事件
 				else
-					rfds[i].fd = rs->cm_id->channel->fd;
+					rfds[i].fd = rs->cm_id->channel->fd;// 否则rs 尚未完成连接的建立，将cm_id-> channel-> fd 作为需要继续监听的fd，加入到rfds 中，监听cm 事件
 			} else {
-				rfds[i].fd = rs->epfd;
+				rfds[i].fd = rs->epfd;// udp
 			}
-			rfds[i].events = POLLIN;
-		} else {
-			rfds[i].fd = fds[i].fd;
+			rfds[i].events = POLLIN;// 将fd 关注的事件类型设为 POLLIN，因为rdma 只产生 POLLIN 事件
+		} else {// 若rsocket 实例不存在
+			rfds[i].fd = fds[i].fd;// 直接监听 fds[].fd
 			rfds[i].events = fds[i].events;
 		}
 		rfds[i].revents = 0;
 	}
+	// return s;
 	return 0;
 }
 
+// 针对rfds 中所有 fds，获取 1 次当前CQ 中所有事件
+// 并再次poll rs ，返回poll 到事件的fd 个数
 static int rs_poll_events(struct pollfd *rfds, struct pollfd *fds, nfds_t nfds)
 {
 	struct rsocket *rs;
@@ -3453,22 +3507,22 @@ static int rs_poll_events(struct pollfd *rfds, struct pollfd *fds, nfds_t nfds)
 	for (i = 0; i < nfds; i++) {
 		rs = idm_lookup(&idm, fds[i].fd);
 		if (rs) {
-			if (rfds[i].revents) {
+			if (rfds[i].revents) {// 若rsocket 存在事件产生
 				fastlock_acquire(&rs->cq_wait_lock);
 				if (rs->type == SOCK_STREAM)
-					rs_get_cq_event(rs);
+					rs_get_cq_event(rs);// 获取 cq 事件
 				else
 					ds_get_cq_event(rs);
 				fastlock_release(&rs->cq_wait_lock);
 			}
-			fds[i].revents = rs_poll_rs(rs, fds[i].events, 1, rs_poll_all);
+			fds[i].revents = rs_poll_rs(rs, fds[i].events, 1, rs_poll_all);// 处理完cq event 现有事件后，再次执行poll rs
 		} else {
 			fds[i].revents = rfds[i].revents;
 		}
-		if (fds[i].revents)
+		if (fds[i].revents)// 如果再次获取到事件，计数器+1
 			cnt++;
 	}
-	return cnt;
+	return cnt;// 返回处理完当前事件后，再次获取到事件的fd 个数
 }
 
 /*
@@ -3488,9 +3542,9 @@ int rpoll(struct pollfd *fds, nfds_t nfds, int timeout)
 	int pollsleep, ret;
 
 	do {
-		ret = rs_poll_check(fds, nfds);
-		if (ret || !timeout)
-			return ret;
+		ret = rs_poll_check(fds, nfds);	// 首先检查一次所有fds数组中fd 上当前能够获取到的事件，保证至少对fd poll 一次
+		if (ret || !timeout)// 若成功获取到了事件，会得到产生了事件的 fd 的个数；否则当timeout 为0时，直接返回
+			return ret;		// ret 可能为产生了事件的fd 个数；也可能由于超时没有获取到事件而为0
 
 		if (!start_time)
 			start_time = rs_time_us();
@@ -3498,33 +3552,34 @@ int rpoll(struct pollfd *fds, nfds_t nfds, int timeout)
 		poll_time = (uint32_t) (rs_time_us() - start_time);
 	} while (poll_time <= polling_time);
 
-	rfds = rs_fds_alloc(nfds);
-	if (!rfds)
+// poll_time 超时且没有获取到事件
+	rfds = rs_fds_alloc(nfds);// 创建rfds 记录pollfd 数组
+	if (!rfds)// rfds 新建失败
 		return ERR(ENOMEM);
 
 	do {
-		ret = rs_poll_arm(rfds, fds, nfds);
-		if (ret)
-			break;
-
-		if (rs_poll_enter())
+		ret = rs_poll_arm(rfds, fds, nfds);// 将rsocket 的cm fd 或 recv cq channel fd 加入到rfds 数组
+		if (ret)// 若已经可以从rfds 中poll 到某个fd 上发生的事件
+			break; // 退出do-while 循环，并返回1
+// rfds 中已加入需要监听事件的fd，且截至目前没有poll 到任何事件
+		if (rs_poll_enter())// 将pollcnt +1，直到 suspendpoll 标志为 1 时，将当前线程yield，并返回-EBUSY
 			continue;
-
+// suspendpoll 标志为1
 		if (timeout >= 0) {
 			timeout -= (int) ((rs_time_us() - start_time) / 1000);
 			if (timeout <= 0)
-				return 0;
+				return 0;// 判断若timeout 超时，返回0
 			pollsleep = min(timeout, wake_up_interval);
 		} else {
-			pollsleep = wake_up_interval;
+			pollsleep = wake_up_interval;	// 若timeout == -1，定期唤醒poll
 		}
 
-		ret = poll(rfds, nfds + 1, pollsleep);
-		if (ret < 0) {
-			rs_poll_exit();
-			break;
+		ret = poll(rfds, nfds + 1, pollsleep);// 使用系统调用poll() 获取rfds 中产生事件的fd 的个数
+		if (ret < 0) {// ret == -1，poll 出错
+			rs_poll_exit();// 出错后执行rs poll 退出，退出前通过signalpoll 再次唤醒所有rsocket 检查是否有事件
+			break; // 退出do-while 循环
 		}
-
+// 若系统调用poll 正常返回
 		ret = rs_poll_events(rfds, fds, nfds);
 		rs_poll_stop();
 	} while (!ret);
@@ -4353,7 +4408,7 @@ out:
 }
 
 /****************************************************************************
- * Service Processing Threads
+ * Service Processing Threads 服务处理线程
  ****************************************************************************/
 
 static int rs_svc_grow_sets(struct rs_svc *svc, int grow_size)
@@ -4379,8 +4434,12 @@ static int rs_svc_grow_sets(struct rs_svc *svc, int grow_size)
 	return 0;
 }
 
-/*
+/* 
+ * 将 rs 添加到 rsocket service 的队列 svc->rss 末尾
+ * 同时，svc-> cnt 记录 svc->rss 中已存在的rs 数量
  * Index 0 is reserved for the service's communication socket.
+ * 为服务通信的socket 保留0 号位置
+ * 
  */
 static int rs_svc_add_rs(struct rs_svc *svc, struct rsocket *rs)
 {

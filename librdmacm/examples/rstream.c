@@ -160,8 +160,8 @@ static int send_xfer(int size)
 
 	for (offset = 0; offset < size; ) {
 		if (use_async) {
-			ret = do_poll(&fds, poll_timeout);
-			if (ret)
+			ret = do_poll(&fds, poll_timeout);// 执行rpoll 获取 fds[0] 上的 event
+			if (ret)// 若do_poll 出错则返回
 				return ret;
 		}
 
@@ -235,7 +235,7 @@ static int run_test(void)
 	for (i = 0; i < iterations; i++) {
 		for (t = 0; t < transfer_count; t++) {
 			ret = dst_addr ? send_xfer(transfer_size) :
-					 recv_xfer(transfer_size);
+					 recv_xfer(transfer_size);// 根据dst 是否存在，判断发送数据还是接收数据
 			if (ret)
 				goto out;
 		}

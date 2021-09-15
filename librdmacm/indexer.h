@@ -94,7 +94,9 @@ static inline void *idm_at(struct index_map *idm, int index)
 	entry = idm->array[idx_array_index(index)];
 	return entry[idx_entry_index(index)];
 }
-
+/*
+ * 根据fd 找到对应rsocket 实例
+ */
 static inline void *idm_lookup(struct index_map *idm, int index)
 {
 	return ((index <= IDX_MAX_INDEX) && idm->array[idx_array_index(index)]) ?

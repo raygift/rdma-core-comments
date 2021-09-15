@@ -848,6 +848,11 @@ ssize_t sendmsg(int socket, const struct msghdr *msg, int flags)
 		rsendmsg(fd, msg, flags) : real.sendmsg(fd, msg, flags);
 }
 
+/*
+ * 向socket 对应fd 执行write 操作
+ * 执行前首先判断socket 对应fd 是否为 rsocket fd，若是则执行 rsend
+ * 否则执行 real.write
+ */
 ssize_t write(int socket, const void *buf, size_t count)
 {
 	int fd;

@@ -151,6 +151,14 @@ int verify_buf(void *buf, int size)
 	return 0;
 }
 
+/*
+ * rdma 使用rpoll 获取fds[0] 上是否有事件产生
+ * 若有事件产生，返回 fds->revents & (POLLERR | POLLHUP) 
+ * 		若产生的事件没有 POLLERR 和POLLUP 掩码，则返回值为0
+ * 		若产生的事件存在POLLERR 或POLLUP ，则返回的为非 0 值
+ * 若 rpoll 返回值不为1，则rpoll 出错，将rpoll 的返回值直接作为do_poll 的返回
+ *
+ */ 
 int do_poll(struct pollfd *fds, int timeout)
 {
 	int ret;

@@ -7,6 +7,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+/* 根据 nonblock 的值设置 fd 的nonblock 属性
+ * 设置成功返回0，失败返回-1
+ */
 int set_fd_nonblock(int fd, bool nonblock)
 {
 	int val;
