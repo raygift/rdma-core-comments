@@ -91,19 +91,20 @@ struct rs_svc_msg {
 	struct rsocket *rs;
 };
 
-/* rsocket service 结构体
+/* rsocket 会创建线程处理链接，rs_svc 用来记录创建的线程ip，以及线程运行所需的相关信息
+ * rsocket service 结构体
  * 存在 tcp_svc ，udp_svc，listen_svc，connect_svc 几种
  * 结构体中记录有需要执行svc 的rsocket 实例，svc 的线程号，上下文等
  */
-struct rs_svc {
-	pthread_t id;
-	int sock[2];
-	int cnt;
-	int size;
-	int context_size;
+struct rs_svc {// 每个svc 可以对应多个rsocket 
+	pthread_t id;// 创建的线程id
+	int sock[2];// 线程通信管道socketpait
+	int cnt;// 线程正在服务的rsocket 对象数量
+	int size;// 线程能够服务的rsocket 对象容量
+	int context_size;// 线程服务的每个rsocket 对应的context 的空间大小
 	void *(*run)(void *svc);
-	struct rsocket **rss;
-	void *contexts;
+	struct rsocket **rss;// 线程正在服务的rsocket 数组指针
+	void *contexts;// 线程服务的所有rsocket 的context 集中存放的位置
 };
 
 static struct pollfd *udp_svc_fds;
@@ -496,35 +497,41 @@ static void ds_remove_qp(struct rsocket *rs, struct ds_qp *qp)
 		rs->qp_list = NULL;
 	}
 }
-
+// 向执行svc 的子线程发送消息，子线程在 cm_svc_run 中获取cmd并执行；
+// 子线程还会对所服务的rsocket fd 进行监听，获取到事件后执行相应操作：
+// 1. 若主线程在listen，则子线程执行listen_svc，监听到事件后执行rs_accept；
+// 2. 若主线程在connect，则子线程执行connect_svc，若根据rs 状态判断主线程仍未完成connect 操作，则执行connect 动作；否则在子线程中处理异常主线程未能处理的cm_event
+// svc 执行完毕后，通知父线程执行结果；父线程等待子进程返回执行结果并退出
 static int rs_notify_svc(struct rs_svc *svc, struct rsocket *rs, int cmd)
 {
+	// printf("rs_notify_svc rs %d cmd %d\n",rs->index,cmd);
 	struct rs_svc_msg msg;
 	int ret;
 
 	pthread_mutex_lock(&svc_mut);
-	if (!svc->cnt) {// svc->cnt == 0 表示尚没有rsocket 实例需要执行svc，也就没有 rsocket 被加入到svc->rss 队列中；需要为 svc 创建线程等
-		ret = socketpair(AF_UNIX, SOCK_STREAM, 0, svc->sock);// 创建socketpair，并创建一个新线程
+	if (!svc->cnt) {// svc->cnt == 0 表示尚未给rsocket 实例创建过线程；
+		ret = socketpair(AF_UNIX, SOCK_STREAM, 0, svc->sock);// 创建 socketpair 流管道，用于在线程间通信，保存在svc->sock 属性中
+		printf("rsocket debug: rs_notify_svc socketpair ret %d, svc->sock %d %d\n",ret,svc->sock[0],svc->sock[1]);
 		if (ret)
 			goto unlock;
 
-		ret = pthread_create(&svc->id, NULL, svc->run, svc);// 创建新线程，从 svc->run 开始执行
-		if (ret) {
+		ret = pthread_create(&svc->id, NULL, svc->run, svc);// 创建新线程，从 svc->run（在文件开头已经将run 赋值为 cm_svc_run ） 开始执行，并传入参数为svc
+		if (ret) {// 创建线程失败，关闭管道
 			ret = ERR(ret);
 			goto closepair;
 		}
 	}
-
+// rsocket 已创建并运行新线程
 	msg.cmd = cmd;
 	msg.status = EINVAL;
 	msg.rs = rs;
-	write_all(svc->sock[0], &msg, sizeof(msg));// 将msg 写入到socket[0]中
-	read_all(svc->sock[0], &msg, sizeof(msg));// 从socket[0]中读取数据，存入msg 中
+	write_all(svc->sock[0], &msg, sizeof(msg));// 将msg 写入到socket[0]中，与子线程通信
+	read_all(svc->sock[0], &msg, sizeof(msg));// 从socket[0]中读取数据，存入msg 中，从子线程读取信息
 	ret = rdma_seterrno(msg.status);// 设置errno
 	if (svc->cnt)// svc->cnt 不为0，表示rsocket service 中已经有rsocket 实例被加入
 		goto unlock;// 跳过等待其他线程，跳过关闭socketpair
 
-	pthread_join(svc->id, NULL);// 访问创建好的新线程，在该线程退出之前阻塞等待
+	pthread_join(svc->id, NULL);// 访问子线程，在该线程退出之前阻塞等待
 closepair:
 	close(svc->sock[0]);
 	close(svc->sock[1]);
@@ -1312,7 +1319,7 @@ int rlisten(int socket, int backlog)
 	if (ret)
 		return ret;
 
-	ret = rs_notify_svc(&listen_svc, rs, RS_SVC_ADD_CM);
+	ret = rs_notify_svc(&listen_svc, rs, RS_SVC_ADD_CM);// 创建子线程，对rs fd
 	if (ret)
 		return ret;
 
@@ -1359,10 +1366,10 @@ static void rs_accept(struct rsocket *rs)
 	rs_format_conn_data(new_rs, &cresp);// 将agent 的buffer 信息发送给client
 	param.private_data = &cresp;
 	param.private_data_len = sizeof cresp;
-	//printf("sizeof cresp %ld\n",sizeof cresp);
-	//printf("before rdma_accept(new_rs->cm_id, &param); fcntl %u, O_NONBLOCK %u\n",fcntl(new_rs->cm_id->channel->fd,F_GETFL),O_NONBLOCK),;
+	//printf("rsocket debug: sizeof cresp %ld\n",sizeof cresp);
+	//printf("rsocket debug: before rdma_accept(new_rs->cm_id, &param); fcntl %u, O_NONBLOCK %u\n",fcntl(new_rs->cm_id->channel->fd,F_GETFL),O_NONBLOCK),;
 	ret = rdma_accept(new_rs->cm_id, &param);
-	//printf("fcntl %u\n",fcntl(new_rs->cm_id->channel->fd,F_GETFL));
+	//printf("rsocket debug: fcntl %u\n",fcntl(new_rs->cm_id->channel->fd,F_GETFL));
 // rdma_accept 执行之后 param 的private_data 被写入到 new_rs->cm_id->channel->fd 中
 	if (!ret)
 		new_rs->state = rs_connect_rdwr;
@@ -1379,7 +1386,8 @@ err:
 	if (new_rs)
 		rs_free(new_rs);
 }
-
+// raccept 并未执行创建socket，相关socket 已经在rlisten 时通过 rs_notify_svc 创建了子线程，用于执行rs_accept 操作
+// raccept 只是从
 int raccept(int socket, struct sockaddr *addr, socklen_t *addrlen)
 {
 	struct rsocket *rs, *new_rs;
@@ -2161,7 +2169,7 @@ static int rs_poll_cq(struct rsocket *rs)
 			default:// 若不是以上 op 类型的数据
 				// printf tcp_msg_op(msg) 得到结果大多是 无符号整数 0，对应表示TCP_OP_DATA；
 				// printf msg 为无符号整数uint32，输出结果为 65535、2048、8192、32768、43072 等值
-				// printf("switch (tcp_msg_op(msg %u ):%u) default ",msg,rs_msg_op(msg));
+				// printf("rsocket debug: switch (tcp_msg_op(msg %u ):%u) default ",msg,rs_msg_op(msg));
 				rs->rmsg[rs->rmsg_tail].op = rs_msg_op(msg); 							// 将数据高3位 存储到 rmsg 队尾元素的 op 属性中
 				rs->rmsg[rs->rmsg_tail].data = rs_msg_data(msg); 						// 将数据低29位 存储到 rmsg 队尾元素的 data 属性中
 				if (++rs->rmsg_tail == rs->rq_size + 1)	// rmsg 队尾元素+1，若达到recv queue 大小，则重置为0
@@ -3774,8 +3782,10 @@ int rclose(int socket)
 			rs_notify_svc(&tcp_svc, rs, RS_SVC_REM_KEEPALIVE);
 		if (rs->opts & RS_OPT_CM_SVC && rs->state == rs_listening)
 			rs_notify_svc(&listen_svc, rs, RS_SVC_REM_CM);
-		if (rs->opts & RS_OPT_CM_SVC)
+		if (rs->opts & RS_OPT_CM_SVC){
+			rs_notify_svc(&accept_svc, rs, RS_SVC_REM_CM);
 			rs_notify_svc(&connect_svc, rs, RS_SVC_REM_CM);
+		}
 	} else {
 		ds_shutdown(rs);
 	}
@@ -4418,22 +4428,24 @@ out:
 /****************************************************************************
  * Service Processing Threads 服务处理线程
  ****************************************************************************/
-
+/* 向svc 中添加rsocket 实例
+ * 使得svc 可以服务多个rsocket
+ */
 static int rs_svc_grow_sets(struct rs_svc *svc, int grow_size)
 {
 	struct rsocket **rss;
 	void *set, *contexts;
-
-	set = calloc(svc->size + grow_size, sizeof(*rss) + svc->context_size);
+// svc 中两个属性：context_size 和 run 
+	set = calloc(svc->size + grow_size, sizeof(*rss) + svc->context_size);// 分配多个 rs对象 和 context 的内存空间，现有两种对象各有size 个，新增 grow_size 个；
 	if (!set)
 		return ENOMEM;
 
 	svc->size += grow_size;
-	rss = set;
-	contexts = set + sizeof(*rss) * svc->size;
+	rss = set;// 新分配的内存空间赋值给rss 作为存放的起始地址
+	contexts = set + sizeof(*rss) * svc->size;// 通过偏移量确定contexts 起始地址（猜测一个rsocket 占用的空间为 [rsocket 指针数组|context数组]
 	if (svc->cnt) {
-		memcpy(rss, svc->rss, sizeof(*rss) * (svc->cnt + 1));
-		memcpy(contexts, svc->contexts, svc->context_size * (svc->cnt + 1));
+		memcpy(rss, svc->rss, sizeof(*rss) * (svc->cnt + 1));// 将当前svc 记录的rsocket 地址的指针复制到新的内存空间
+		memcpy(contexts, svc->contexts, svc->context_size * (svc->cnt + 1));// 将当前svc 记录的rsocket 对应的context 复制到新的内存地址空间
 	}
 
 	free(svc->rss);
@@ -4442,8 +4454,8 @@ static int rs_svc_grow_sets(struct rs_svc *svc, int grow_size)
 	return 0;
 }
 
-/* 
- * 将 rs 添加到 rsocket service 的队列 svc->rss 末尾
+/* svc 添加所服务的rsocket 对象
+ * 将 rs 添加到 svc->rss 数组末尾
  * 同时，svc-> cnt 记录 svc->rss 中已存在的rs 数量
  * Index 0 is reserved for the service's communication socket.
  * 为服务通信的socket 保留0 号位置
@@ -4452,14 +4464,14 @@ static int rs_svc_grow_sets(struct rs_svc *svc, int grow_size)
 static int rs_svc_add_rs(struct rs_svc *svc, struct rsocket *rs)
 {
 	int ret;
-
-	if (svc->cnt >= svc->size - 1) {
-		ret = rs_svc_grow_sets(svc, 4);
+printf("rsocket debug: svc add rs %d\n",rs->index);
+	if (svc->cnt >= svc->size - 1) {// 0号位置为服务之间通信的socket 保留，因此所服务的rsocket 数量达到 size-1 时就需要增加svc 存储数据的内存
+		ret = rs_svc_grow_sets(svc, 4);// 增加内存空间
 		if (ret)
 			return ret;
 	}
 
-	svc->rss[++svc->cnt] = rs;
+	svc->rss[++svc->cnt] = rs;// 将新加入的rsocket 指针放入最后一个位置
 	return 0;
 }
 
@@ -4467,15 +4479,17 @@ static int rs_svc_index(struct rs_svc *svc, struct rsocket *rs)
 {
 	int i;
 
-	for (i = 1; i <= svc->cnt; i++) {
+	for (i = 1; i <= svc->cnt; i++) {// 0号位置保留
 		if (svc->rss[i] == rs)
 			return i;
 	}
 	return -1;
 }
-
+// 将rs 从svc 需要服务的对象中删除
 static int rs_svc_rm_rs(struct rs_svc *svc, struct rsocket *rs)
 {
+printf("rsocket debug: svc rm rs->index %d svc_index %d\n",rs->index,rs_svc_index(svc, rs));
+
 	int i;
 
 	if ((i = rs_svc_index(svc, rs)) >= 0) {
@@ -4486,6 +4500,7 @@ static int rs_svc_rm_rs(struct rs_svc *svc, struct rsocket *rs)
 		svc->cnt--;
 		return 0;
 	}
+	
 	return EBADF;
 }
 
@@ -4836,38 +4851,39 @@ static void rs_handle_cm_event(struct rsocket *rs)
 	if (!(rs->state & rs_opening))
 		rs_poll_signal();
 }
-
+// 子线程处理父线程传递来的消息
 static void cm_svc_process_sock(struct rs_svc *svc)
 {
 	struct rs_svc_msg msg;
 	struct pollfd *fds;
 
-	read_all(svc->sock[1], &msg, sizeof(msg));
-	switch (msg.cmd) {
-	case RS_SVC_ADD_CM:
+	read_all(svc->sock[1], &msg, sizeof(msg));// 从线程通信sock 中读取消息
+	switch (msg.cmd) {// 判断消息类型
+	case RS_SVC_ADD_CM:// add cm 表示向svc 中添加所服务的rsocket 对象
 		msg.status = rs_svc_add_rs(svc, msg.rs);
-		if (!msg.status) {
-			msg.rs->opts |= RS_OPT_CM_SVC;
+		if (!msg.status) {// 添加成功，需要通知父线程对rs 执行删除svc 操作
+			msg.rs->opts |= RS_OPT_CM_SVC;// 向父线程发送的消息 rs操作类型设为操作CM_SVC，父线程收到消息后会执行rm_cm_svc 操作
 			fds = svc->contexts;
-			fds[svc->cnt].fd = msg.rs->cm_id->channel->fd;
+			fds[svc->cnt].fd = msg.rs->cm_id->channel->fd;// fds 最后一个fd 设为msg 对应rsocket 的channel fd
 			fds[svc->cnt].events = POLLIN;
 			fds[svc->cnt].revents = 0;
 		}
 		break;
-	case RS_SVC_REM_CM:
+	case RS_SVC_REM_CM:// 将rsocket 从svc 服务对象中删除
 		msg.status = rs_svc_rm_rs(svc, msg.rs);
 		if (!msg.status)
-			msg.rs->opts &= ~RS_OPT_CM_SVC;
+			msg.rs->opts &= ~RS_OPT_CM_SVC;// 删除成功，将rsocket opt 的opt cm svc 清除，避免后续误删除
 		break;
-	case RS_SVC_NOOP:
+	case RS_SVC_NOOP:// 不执行任何操作
 		msg.status = 0;
 		break;
 	default:
 		break;
 	}
-	write_all(svc->sock[1], &msg, sizeof(msg));
+	write_all(svc->sock[1], &msg, sizeof(msg));// 向父线程发送消息
 }
 
+// rs_notify_svc 创建的服务子线程从此处开始执行
 static void *cm_svc_run(void *arg)
 {
 	struct rs_svc *svc = arg;
@@ -4875,34 +4891,38 @@ static void *cm_svc_run(void *arg)
 	struct rs_svc_msg msg;
 	int i, ret;
 
-	ret = rs_svc_grow_sets(svc, 4);
+	ret = rs_svc_grow_sets(svc, 4);// svc 服务的rsocket 增加4个（为什么是4个？）
 	if (ret) {
-		msg.status = ret;
+		msg.status = ret;// 增加空间失败，将失败信息传递给父线程
 		write_all(svc->sock[1], &msg, sizeof(msg));
-		return (void *) (uintptr_t) ret;
+		return (void *) (uintptr_t) ret;// 子线程退出
 	}
 
-	fds = svc->contexts;
-	fds[0].fd = svc->sock[1];
-	fds[0].events = POLLIN;
+	fds = svc->contexts;// 获取父线程传递过来的svc 中记录的fds（何时将fd 添加到contexts 的？）// listen_svc 的context_size 使用的是sizeof(pollfd)， 
+	fds[0].fd = svc->sock[1];// svc 的0号位置，保存线程通信的socketpair[1]
+	fds[0].events = POLLIN;// 关注线程通信的socketpair[1] 上的可读事件
+	for (int k=0;k<=svc->cnt;k++){
+		// printf("rsocket debug: svc->contexts[%d] %d\n",k,((struct pollfd*)&fds[k])->fd);
+	}
 	do {
 		for (i = 0; i <= svc->cnt; i++)
-			fds[i].revents = 0;
+			fds[i].revents = 0;// 清空所有监听fd 已获取到的事件
 
-		poll(fds, svc->cnt + 1, -1);
-		if (fds[0].revents)
+		poll(fds, svc->cnt + 1, -1);// svc->cnt 记录了svc 共服务于多少个rsocket，加上0号位置的线程通信socket，因此需要cnt+1；第三个参数timeout 为-1 表示永远等待直到有事件产生
+		if (fds[0].revents)// 若获取到线程通信sock 上有事件产生，表示父线程传递了消息给子线程，此时父线程传递给子线程的msg 里存了要加入 svc 的rs
 			cm_svc_process_sock(svc);
 
-		for (i = 1; i <= svc->cnt; i++) {
+		for (i = 1; i <= svc->cnt; i++) {// 遍历fds 中所有fd
 			if (!fds[i].revents)
 				continue;
+			printf("rsocket debug: fd[%d] revents %d\n",((struct pollfd*)&fds[i])->fd,fds[i].revents);
 
-			if (svc == &listen_svc)
+			if (svc == &listen_svc)// 若针对某个fd，产生了事件，判断svc 是否为listen_svc，若是则执行accept
 				rs_accept(svc->rss[i]);
 			else
-				rs_handle_cm_event(svc->rss[i]);
+				rs_handle_cm_event(svc->rss[i]);// 若不是listen_svc，认为是connect_svc，
 		}
-	} while (svc->cnt >= 1);
+	} while (svc->cnt >= 1);// svc 所服务的rsocket 不为空时，循环执行
 
 	return NULL;
 }
