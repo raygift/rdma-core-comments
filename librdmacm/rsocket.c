@@ -115,6 +115,8 @@ static struct rs_svc udp_svc = {
 };
 static uint64_t *tcp_svc_timeouts;
 static void *tcp_svc_run(void *arg);
+
+// tcp_svc 用于支持 RS_OPT_KEEPALIVE，创建线程定期执行keepalive 消息的发送
 static struct rs_svc tcp_svc = {
 	.context_size = sizeof(*tcp_svc_timeouts),
 	.run = tcp_svc_run
@@ -4821,7 +4823,7 @@ static void *tcp_svc_run(void *arg)
 		now = rs_get_time();
 		next_timeout = ~0;
 		for (i = 1; i <= svc->cnt; i++) {
-			if (tcp_svc_timeouts[i] <= now) {
+			if (tcp_svc_timeouts[i] <= now) {// 当前时间点超过timeouts 时间，执行keepalive 探测
 				tcp_svc_send_keepalive(svc->rss[i]);
 				tcp_svc_timeouts[i] =
 					now + svc->rss[i]->keepalive_time;
